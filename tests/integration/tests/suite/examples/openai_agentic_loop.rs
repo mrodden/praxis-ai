@@ -427,6 +427,428 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
+#[test]
+fn agentic_guardrail_blocks_mcp_result_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guarded_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guarded_1",
+            "call_id": "call_guarded_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let forbidden_second_response = serde_json::json!({
+        "id": "resp_guarded_2",
+        "object": "response",
+        "status": "completed",
+        "output": []
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, forbidden_second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"blocked","content":"blocked","rail":"indirect_prompt_injection"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        403,
+        "blocked tool result must terminate the loop: {raw}"
+    );
+    assert!(
+        parse_body(&raw).contains("indirect_prompt_injection"),
+        "the guardrail reason should reach the client: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the assigned MCP call should execute once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "a poisoned local result must never reach a second inference request"
+    );
+
+    let checks = nemo.requests();
+    assert_eq!(
+        checks.len(),
+        1,
+        "the newly produced result should be checked exactly once"
+    );
+    assert_eq!(checks[0].uri, "/v1/checks");
+    let check: serde_json::Value = serde_json::from_str(&checks[0].body).expect("NeMo request should contain JSON");
+    assert_eq!(check["guardrails"]["rail_types"], serde_json::json!(["input"]));
+    assert_eq!(check["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(check["messages"][0]["role"], "user");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("mock result for get_weather")),
+        "NeMo must receive the MCP result rather than the stale IRR request body: {check:#}"
+    );
+}
+
+#[test]
+fn layered_agentic_guardrails_each_check_the_local_mcp_result() {
+    let first_response = serde_json::json!({
+        "id": "resp_layered_guardrails_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_layered_guardrails_1",
+            "call_id": "call_layered_guardrails_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_layered_guardrails_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"safe"}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let first_nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"passed","content":"first policy passed"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let second_nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"passed","content":"second policy passed"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let loop_owner = "              # Sole continuation and terminal-response owner.";
+    assert_eq!(
+        yaml.matches(loop_owner).count(),
+        1,
+        "the example needs one loop-owner anchor"
+    );
+    let second_filter = concat!(
+        "              - filter: ai_guardrails\n",
+        "                provider:\n",
+        "                  type: nemo\n",
+        "                  endpoint: \"http://127.0.0.1:3003/v1/checks\"\n",
+        "                  guardrails:\n",
+        "                    config_ids: [\"second-policy\"]\n",
+        "                  timeout_ms: 5000\n",
+        "                  max_message_checks: 32\n",
+        "                phase:\n",
+        "                  request: false\n",
+        "                  response: false\n",
+        "                  tool_results: true\n\n",
+    );
+    let yaml = yaml.replacen(loop_owner, &format!("{second_filter}{loop_owner}"), 1);
+    let proxy_port = free_port();
+    let config = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", first_nemo.port()),
+            ("127.0.0.1:3003", second_nemo.port()),
+        ]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&config).expect("two-policy config should parse");
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "both guardrails should pass the result: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a result checked by both policies should re-enter inference"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 1);
+    for nemo in [&first_nemo, &second_nemo] {
+        let checks = nemo.requests();
+        assert_eq!(
+            checks.len(),
+            1,
+            "each configured policy must receive one tool-result check"
+        );
+        let check: serde_json::Value = serde_json::from_str(&checks[0].body).expect("NeMo request JSON");
+        assert!(
+            check["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("mock result for get_weather")),
+            "each policy must inspect the newly produced MCP result: {check:#}"
+        );
+    }
+}
+
+#[test]
+fn agentic_guardrail_provider_failure_blocks_mcp_result_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guardrail_error_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guardrail_error_1",
+            "call_id": "call_guardrail_error_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(503, "NeMo unavailable".to_owned())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "a NeMo outage must fail closed: {raw}");
+    assert!(
+        parse_body(&raw).contains("guardrail_error"),
+        "the failure code should be exposed: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the local result must be produced once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "a result that NeMo could not check must not reach another inference request"
+    );
+    assert_eq!(nemo.requests().len(), 1, "NeMo should receive one check request");
+}
+
+#[test]
+fn agentic_guardrail_modified_mcp_result_fails_closed_before_second_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_guardrail_modified_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_guardrail_modified_1",
+            "call_id": "call_guardrail_modified_1",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"modified","content":"masked tool result","rail":"pii"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model.port(), nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "modified tool results must fail closed: {raw}");
+    assert!(
+        parse_body(&raw).contains("guardrail_error"),
+        "the failure code should be exposed: {raw}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the MCP result should be produced once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "NeMo's modified text is not yet mapped back to the canonical result, so re-entry must not occur"
+    );
+    assert_eq!(nemo.requests().len(), 1, "NeMo should receive one check request");
+}
+
+#[test]
+fn agentic_guardrail_block_ends_committed_stream_with_sse_error() {
+    let tool_call = serde_json::json!({
+        "type": "function_call",
+        "id": "fc_guardrail_stream_1",
+        "call_id": "call_guardrail_stream_1",
+        "name": "weather__get_weather",
+        "arguments": r#"{"location":"SF"}"#,
+        "status": "completed"
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_guardrail_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_guardrail_stream_1",
+                "output_index": 0,
+                "item": tool_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_guardrail_stream_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [tool_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 2
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response]);
+    let nemo = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"status":"blocked","content":"blocked","rail":"indirect_prompt_injection"}"#.to_owned(),
+    )])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_agentic_guardrails_config(proxy_port, model_port, nemo.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+    model_thread.join().expect("streaming model should finish");
+
+    assert_eq!(parse_status(&raw), 200, "the committed stream keeps HTTP 200: {raw}");
+    assert!(
+        body.contains("event: error"),
+        "the blocked result should end the stream with an error: {body}"
+    );
+    assert!(
+        body.contains("content_blocked"),
+        "the SSE error should carry the block code: {body}"
+    );
+    assert!(
+        !body.contains("data: [DONE]"),
+        "the terminal error must close the stream without [DONE]"
+    );
+    assert_eq!(mcp.method_count("tools/call"), 1);
+    assert_eq!(nemo.requests().len(), 1);
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model requests lock should not be poisoned")
+            .len(),
+        1,
+        "a blocked tool result must never reach a second streamed inference"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Issue #1022: successful mcp_list_tools discovery lifecycle (buffered)
 // -----------------------------------------------------------------------------
@@ -1650,7 +2072,6 @@ fn streaming_mcp_two_tool_batch_uses_one_logical_sse_response() {
     );
 }
 
-
 #[test]
 fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
     let first_response = vec![
@@ -2218,6 +2639,23 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         model_reqs.len(),
         3,
         "model backend should receive exactly three requests"
+    );
+
+    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
+    // they share one initialized session. The server therefore sees a single
+    // dispatch handshake covering both tools/call rounds; the only other
+    // initialize/tools/list pair comes from tool discovery
+    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
+    // would re-handshake, yielding initialize == 3.
+    assert_eq!(
+        mcp.method_count("initialize"),
+        2,
+        "one discovery handshake + one reused dispatch handshake across both rounds"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        1,
+        "tool discovery lists the server once"
     );
 
     // Both tools executed exactly once.
@@ -6076,7 +6514,7 @@ fn approval_round_trip_approve_executes_tool_once() {
 
 // A continuation turn (one carrying `previous_response_id`) that emits a *fresh*
 // approval-gated call must still surface the `mcp_approval_request` rather than
-// failing closed. `openai_response_store` arms exchange-scoped persistence during
+// failing closed. `openai_responses_store` arms exchange-scoped persistence during
 // the request phase, but `openai_responses_rehydrate` runs afterward and replaces
 // `ResponsesState` to splice in the prior turn's history. Rehydrate must carry the
 // persistence-armed marker across that replacement; otherwise `mcp_dispatch` reads
@@ -6944,11 +7382,13 @@ fn approval_with_store_disabled_on_committed_stream_emits_sse_error() {
 
 #[test]
 fn approval_batch_exceeding_cap_is_rejected() {
-    // The agentic loop issues exactly one function call per round, so a resume
-    // turn carries a single mcp_approval_response. A larger batch is a client
-    // error and, left unbounded, could exceed PostgreSQL's 16-bit Bind
-    // parameter ceiling in the consume query, so it must fail closed before any
-    // store work or inference.
+    // A single model round can emit several mcp_approval_request items (batched
+    // or parallel tool calls), so a resume turn may legitimately carry several
+    // mcp_approval_response items. The ceiling is the per-round MCP cap
+    // (max_calls_per_round: 32 in agentic-loop.yaml): a batch larger than one
+    // round could have produced is a client error that must fail closed before
+    // any store work or inference, keeping the pending-approval load query well
+    // under PostgreSQL's 16-bit Bind parameter ceiling.
     let model = StatefulCapturingBackend::new(vec![(200, approval_call_response())]).start_with_shutdown();
     let mcp = approval_weather_mock();
 
@@ -6961,16 +7401,25 @@ fn approval_batch_exceeding_cap_is_rejected() {
 
     let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
 
-    // Turn 2: a follow-up carrying two mcp_approval_response items exceeds the
-    // one-per-round cap and must be rejected before resume.
+    // Turn 2: a follow-up carrying more mcp_approval_response items than the
+    // configured per-round cap (32) exceeds the batch ceiling and must be
+    // rejected before resume. Pad the real approval with fabricated ids until
+    // the batch holds 33 items (> 32).
+    let mut batch = vec![serde_json::json!(
+        {"type": "mcp_approval_response", "approval_request_id": approval_id, "approve": true}
+    )];
+    for i in 0..32 {
+        batch.push(serde_json::json!({
+            "type": "mcp_approval_response",
+            "approval_request_id": format!("call_appr_weather_{i}"),
+            "approve": true
+        }));
+    }
     let followup = serde_json::to_string(&serde_json::json!({
         "model": "gpt-4.1",
         "previous_response_id": previous_response_id,
         "tools": tools,
-        "input": [
-            {"type": "mcp_approval_response", "approval_request_id": approval_id, "approve": true},
-            {"type": "mcp_approval_response", "approval_request_id": "call_appr_weather_2", "approve": true}
-        ]
+        "input": batch
     }))
     .unwrap();
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
@@ -6997,6 +7446,263 @@ fn approval_batch_exceeding_cap_is_rejected() {
         model.requests().len(),
         1,
         "only the approval-request turn reaches inference; the oversized batch is rejected before resume"
+    );
+}
+
+/// The MCP fixture with two approval-gated tools, used by the multi-approval
+/// batch round-trip tests.
+fn approval_two_tool_mock() -> praxis_test_utils::McpMockServerGuard {
+    start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time in a timezone")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                    "required": ["timezone"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    })
+}
+
+/// A model turn that asks to call two approval-gated MCP tools in one round, so
+/// the proxy emits two `mcp_approval_request` items from a single batch.
+fn approval_two_call_response() -> String {
+    serde_json::json!({
+        "id": "resp_appr_batch_1",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_appr_weather",
+                "call_id": "call_appr_weather",
+                "name": "weather__get_weather",
+                "arguments": r#"{"location":"SF"}"#,
+                "status": "completed"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_appr_time",
+                "call_id": "call_appr_time",
+                "name": "weather__get_time",
+                "arguments": r#"{"timezone":"America/Los_Angeles"}"#,
+                "status": "completed"
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// The MCP tool definition (both tools, approval always required) re-sent on
+/// every turn so `openai_mcp_tool_resolve` repopulates the tool map on resume.
+fn approval_two_tools(mcp_port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+        "allowed_tools": ["get_weather", "get_time"],
+        "require_approval": "always"
+    }])
+}
+
+/// Drive the first turn of a two-approval round and return the two approval ids
+/// plus the originating `previous_response_id`. Asserts both gated calls surface
+/// as `mcp_approval_request` items and that neither tool ran while awaiting
+/// approval.
+fn request_two_approvals(
+    proxy_addr: &str,
+    mcp: &praxis_test_utils::McpMockServerGuard,
+    tools: &serde_json::Value,
+) -> (String, String, String) {
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What are the weather and time in SF?",
+        "parallel_tool_calls": true,
+        "tools": tools,
+    });
+    let raw = http_send(
+        proxy_addr,
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approval-required request should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let response_id = response["id"].as_str().expect("response id").to_owned();
+
+    let output = response["output"].as_array().expect("output array");
+    let approvals: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|item| item["type"] == "mcp_approval_request")
+        .collect();
+    assert_eq!(
+        approvals.len(),
+        2,
+        "one round can emit several approvals: both gated calls must surface: {output:#?}"
+    );
+    let weather = approvals
+        .iter()
+        .find(|item| item["name"] == "get_weather")
+        .expect("weather approval request");
+    let time = approvals
+        .iter()
+        .find(|item| item["name"] == "get_time")
+        .expect("time approval request");
+    let weather_id = weather["id"].as_str().expect("weather approval id").to_owned();
+    let time_id = time["id"].as_str().expect("time approval id").to_owned();
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no tool may execute while an approval is pending"
+    );
+
+    (weather_id, time_id, response_id)
+}
+
+#[test]
+fn approval_batch_resume_executes_multiple_approved_tools() {
+    // A single round emits two approval requests; a resume turn carrying both
+    // mcp_approval_response items (approve+approve) must consume both atomically
+    // and dispatch both tools once before resuming to the final answer. This is
+    // the end-to-end counterpart to the resume_applies_multiple_approvals_in_one_batch
+    // unit test, exercising the real HTTP path and tool-map repopulation.
+    let model = StatefulCapturingBackend::new(vec![
+        (200, approval_two_call_response()),
+        (200, approval_final_response()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_two_tool_mock();
+
+    let db = TempSqlite::new("issue1146_batch_approve");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_two_tools(mcp.port());
+
+    let (weather_id, time_id, previous_response_id) = request_two_approvals(proxy.addr(), &mcp, &tools);
+    assert_eq!(weather_id, "call_appr_weather", "approval id must equal the call id");
+    assert_eq!(time_id, "call_appr_time", "approval id must equal the call id");
+
+    // Turn 2: approve both in one batch.
+    let followup = serde_json::to_string(&serde_json::json!({
+        "model": "gpt-4.1",
+        "previous_response_id": previous_response_id,
+        "tools": tools,
+        "input": [
+            {"type": "mcp_approval_response", "approval_request_id": weather_id, "approve": true},
+            {"type": "mcp_approval_response", "approval_request_id": time_id, "approve": true}
+        ]
+    }))
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved batch follow-up should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "an approved batch must resume model→tools→model"
+    );
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        2,
+        "both approved tools must execute exactly once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the model runs once to request approvals and once after the batch resumes"
+    );
+}
+
+#[test]
+fn approval_batch_resume_mixed_approve_and_deny() {
+    // A resume turn can carry a mixed batch: approving one call and denying its
+    // sibling. Only the approved tool executes; the denied call reaches the model
+    // as a truthful function_call_output and never fabricates an mcp_call.
+    let model = StatefulCapturingBackend::new(vec![
+        (200, approval_two_call_response()),
+        (200, approval_final_response()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_two_tool_mock();
+
+    let db = TempSqlite::new("issue1146_batch_mixed");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_two_tools(mcp.port());
+
+    let (weather_id, time_id, previous_response_id) = request_two_approvals(proxy.addr(), &mcp, &tools);
+
+    // Turn 2: approve the weather call, deny the time call.
+    let followup = serde_json::to_string(&serde_json::json!({
+        "model": "gpt-4.1",
+        "previous_response_id": previous_response_id,
+        "tools": tools,
+        "input": [
+            {"type": "mcp_approval_response", "approval_request_id": weather_id, "approve": true},
+            {"type": "mcp_approval_response", "approval_request_id": time_id, "approve": false}
+        ]
+    }))
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "mixed batch follow-up should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "a mixed batch must still resume to a final answer"
+    );
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the approved tool may execute; the denied sibling must not run"
+    );
+
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        2,
+        "the model runs once to request approvals and once after the batch resumes"
+    );
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request should be JSON");
+    let input = second_body["input"].as_array().expect("second request input array");
+    let denial = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_appr_time")
+        .expect("the denied call must reach the model as a correlated function_call_output");
+    assert!(
+        denial["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("denied by the user")),
+        "the denial must be a truthful, human-readable notice: {denial:#?}"
     );
 }
 
@@ -7181,6 +7887,17 @@ fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::co
     load_loopback_mcp_config_inner(proxy_port, model_port, false)
 }
 
+fn load_agentic_guardrails_config(proxy_port: u16, model_port: u16, nemo_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read guarded agentic-loop example");
+    let yaml = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:3002", nemo_port)]),
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse guarded agentic-loop config")
+}
+
 fn load_loopback_mcp_config_inner(
     proxy_port: u16,
     model_port: u16,
@@ -7265,7 +7982,7 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
-/// Like [`load_approval_config`] but with the `openai_response_store` backend
+/// Like [`load_approval_config`] but with the `openai_responses_store` backend
 /// removed, so the pipeline runs with an empty `ResponseStoreRegistry` (the
 /// registry extension is always injected by the server). Models a deployment
 /// that wired the MCP approval flow but forgot to configure persistence.
@@ -7274,11 +7991,11 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
+    let store_block = "      - filter: openai_responses_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(
         without_store, yaml,
-        "expected to remove the openai_response_store block from agentic-loop.yaml; its config may have changed"
+        "expected to remove the openai_responses_store block from agentic-loop.yaml; its config may have changed"
     );
     praxis_core::config::Config::from_yaml(&without_store).expect("parse store-less approval config")
 }

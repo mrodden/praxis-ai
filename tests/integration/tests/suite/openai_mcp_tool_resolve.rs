@@ -5,10 +5,19 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send, json_post,
-    parse_body, parse_status, start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config,
-    start_proxy,
+    Backend, McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send,
+    json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
+    start_mcp_mock_server_with_config, start_proxy,
 };
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Controlled loopback address used for runtime connection-failure tests.
+/// Their configs explicitly opt into private upstreams so the requests pass
+/// address validation without contacting an external service.
+const CONTROLLED_MCP_FAILURE_HOST: &str = "127.0.0.1";
 
 // =============================================================================
 // Pass-Through (no MCP tools)
@@ -135,12 +144,12 @@ fn mcp_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -153,12 +162,12 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -181,7 +190,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
         "failed MCP output item should identify the server: {response_body}"
     );
     // The lifecycle snapshots echo the requested model. In the shipped pipeline
-    // the format filter promotes it to `openai_responses_format.model` metadata,
+    // the classifier promotes it to `openai_responses_request.model` metadata,
     // so this exercises the metadata branch (not the ResponsesState fallback the
     // unit tests cover).
     assert!(
@@ -198,7 +207,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
 // mcp_tool_resolve). A streaming `tools/list` runtime failure is emitted as a
 // 200 SSE lifecycle; because it is a `TerminalResponse` (not a `Reject`), the
 // response phase runs `openai_stream_events` (which accumulates the terminal
-// `response.failed`) and `openai_response_store` (which persists it) so a caller
+// `response.failed`) and `openai_responses_store` (which persists it) so a caller
 // can later retrieve the failed response -- all without contacting the backend.
 // =============================================================================
 
@@ -292,15 +301,12 @@ fn run_streaming_mcp_failure_with_yaml(
     let dead_port = free_port();
     let db = TempSqlite::new(test_name);
 
-    let yaml = build_yaml(proxy_port, backend.port(), db.url(), 500);
+    let yaml = with_private_upstreams(build_yaml(proxy_port, backend.port(), db.url(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
-    // discovery attempt reaches runtime I/O and fails (a runtime failure), not a
-    // local request-policy failure like SSRF.
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
@@ -481,7 +487,7 @@ async fn streaming_list_failure_persists_when_stream_events_after_resolve() {
 /// Regression for a persistence gap in the store-without-validate/rehydrate
 /// configuration: when no filter builds a `ResponsesState` before the resolver,
 /// the terminal-failure build must CREATE the state (not just mutate an existing
-/// one) so `openai_response_store` has a `response_object` to persist. With a
+/// one) so `openai_responses_store` has a `response_object` to persist. With a
 /// `get_mut`-only write this GET would 404 despite `store` defaulting to enabled;
 /// `get_or_insert_with` makes the failed response retrievable regardless of which
 /// upstream filters ran.
@@ -742,12 +748,12 @@ fn authorization_with_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://192.0.2.1:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -768,12 +774,12 @@ fn mcp_tool_names_filter_object_accepted() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -820,6 +826,139 @@ fn mcp_tools_list_succeeds_against_mock_server() {
     assert!(
         mcp_server.method_count("tools/list") >= 1,
         "should have called tools/list on MCP server"
+    );
+}
+
+#[test]
+fn same_direct_url_reuses_persisted_listing() {
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let backend_body = r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#;
+    let backend = Backend::fixed(backend_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_same_target");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
+    let first_response: serde_json::Value = serde_json::from_str(&parse_body(&first)).unwrap();
+    let persisted_listing = first_response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "mcp_list_tools"))
+        .expect("first response should contain the persisted MCP listing");
+    assert!(
+        persisted_listing.get("server_url").is_none(),
+        "public listing must not expose the target URL"
+    );
+    let (get_status, get_body) = http_get(proxy.addr(), "/v1/responses/resp_previous", None);
+    assert_eq!(get_status, 200, "stored response should be retrievable");
+    assert!(
+        !get_body.contains(&mcp_url),
+        "retrieved response must not expose the private target URL"
+    );
+    let list_calls = mcp.method_count("tools/list");
+    assert!(list_calls >= 1, "first request should discover MCP tools");
+
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        list_calls,
+        "an unchanged direct target should reuse its persisted listing"
+    );
+}
+
+#[test]
+fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
+    let old_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let new_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let backend = Backend::fixed(
+        r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#,
+    )
+    .header("content-type", "application/json")
+    .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_target_identity");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let old_url = format!("http://127.0.0.1:{}/mcp", old_mcp.port());
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{old_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
+    assert!(
+        old_mcp.method_count("tools/list") >= 1,
+        "first direct URL should be resolved"
+    );
+
+    let new_url = format!("http://127.0.0.1:{}/mcp", new_mcp.port());
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{new_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    let new_list_calls = new_mcp.method_count("tools/list");
+    assert!(new_list_calls >= 1, "changed direct URL must fetch its own listing");
+    let continuation_response: serde_json::Value = serde_json::from_str(&parse_body(&continuation)).unwrap();
+    assert!(
+        continuation_response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "mcp_list_tools")
+            .all(|item| item.get("server_url").is_none()),
+        "public output must not expose either target URL"
+    );
+
+    let third = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+    assert_eq!(parse_status(&third), 200, "second continuation should succeed");
+    assert_eq!(
+        new_mcp.method_count("tools/list"),
+        new_list_calls,
+        "A → B → B with identical tool names should reuse B's private listing"
     );
 }
 
@@ -1378,14 +1517,27 @@ fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
     resolve_yaml_with_timeout(proxy_port, backend_port, 5000)
 }
 
+/// Enable loopback MCP targets for tests that deliberately exercise transport
+/// failures after address-policy validation.
+fn with_private_upstreams(yaml: String) -> String {
+    if yaml.contains("  allow_private_upstreams: true") {
+        return yaml;
+    }
+    yaml.replacen(
+        "insecure_options:\n",
+        "insecure_options:\n  allow_private_upstreams: true\n",
+        1,
+    )
+}
+
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
-/// store retrieval: `openai_response_store` runs pre-IRR, before
+/// store retrieval: `openai_responses_store` runs pre-IRR, before
 /// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
 /// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
 /// and in the shipped `full-flow-agentic.yaml` it lives inside the IRR that follows the
 /// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
 /// resolver self-delivers the 200 SSE failure lifecycle and writes
-/// `ResponsesState.response_object` directly, so `openai_response_store` persists
+/// `ResponsesState.response_object` directly, so `openai_responses_store` persists
 /// the synthesized failure without any stream_events involvement.
 fn resolve_yaml_full_flow_store(proxy_port: u16, backend_port: u16, db_url: &str, timeout_ms: u64) -> String {
     format!(
@@ -1400,14 +1552,22 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1455,14 +1615,22 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1482,17 +1650,18 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }
 
-/// Minimal store pipeline with `openai_response_store` + `openai_mcp_tool_resolve`
-/// but WITHOUT `openai_responses_validate`/`openai_responses_rehydrate` (and no
+/// Minimal store pipeline with `openai_responses_store` + `openai_mcp_tool_resolve`
+/// but WITHOUT `openai_responses_request`/`openai_responses_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
 /// writes the terminal snapshot (`get_or_insert_with`, not `get_mut`). The store
 /// still triggers streaming persistence -- its gating reads only
-/// `openai_responses_format.*` metadata, which `openai_responses_format`
+/// `openai_responses_request.*` metadata, which `openai_responses_request`
 /// (always first) supplies -- and `build_record_from_state` reads only
 /// `response_object`, so a default state carrying just that field suffices.
 fn resolve_yaml_store_no_validate_rehydrate(
@@ -1513,13 +1682,15 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1551,7 +1722,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1581,7 +1754,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1612,7 +1787,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1642,7 +1819,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1673,7 +1852,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1709,7 +1890,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve

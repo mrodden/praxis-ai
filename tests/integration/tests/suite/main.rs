@@ -49,6 +49,7 @@ mod conversations_rehydrate;
 mod error_response_formatter;
 mod examples;
 mod failure_mode;
+mod fips;
 mod guardrails;
 mod harness;
 // Several replayed scenarios run examples backed by the SQLite response store.
@@ -58,8 +59,8 @@ mod mcp;
 mod mcp_broker;
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;
-mod openai_responses_format;
 mod openai_responses_model_rewrite;
+mod openai_responses_request;
 mod openai_tool_parse;
 mod prompt_enrich;
 mod responses_routing;

@@ -50,14 +50,30 @@ impl AiRequestFormat {
 #[expect(clippy::struct_excessive_bools, reason = "independent presence flags from JSON body")]
 pub(crate) struct ClassifiedRequest {
     /// Extracted `background` field value, if present.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub background: Option<bool>,
     /// Detected body format.
     pub format: AiRequestFormat,
     /// Whether `conversation` is present and non-null.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub has_conversation: bool,
     /// Whether `previous_response_id` is present and non-null.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub has_previous_response_id: bool,
     /// Whether `prompt.id` is present and non-null.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub has_prompt_id: bool,
     /// Whether `tools` is a non-empty array (coarse presence check).
     ///
@@ -67,15 +83,23 @@ pub(crate) struct ClassifiedRequest {
     /// [`openai_tool_parse`] applies stricter per-entry classification and
     /// may disagree on malformed arrays.
     ///
-    /// [`openai_tool_parse`]: crate::openai::responses::openai_tool_parse
+    /// [`openai_tool_parse`]: crate::openai::responses::tool_parse
     pub has_tools: bool,
     /// Extracted `max_output_tokens` field value (Responses API), if present.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub max_output_tokens: Option<u64>,
     /// Extracted `max_tokens` field value, if present.
     pub max_tokens: Option<u64>,
     /// Extracted `model` field value, if present.
     pub model: Option<String>,
     /// Extracted `store` field value, if present.
+    #[cfg_attr(
+        all(not(feature = "openai-responses"), not(test)),
+        expect(dead_code, reason = "read only by the Responses request processor")
+    )]
     pub store: Option<bool>,
     /// Extracted `stream` field value, if present.
     pub stream: Option<bool>,
@@ -85,40 +109,6 @@ pub(crate) struct ClassifiedRequest {
 // Path Classification
 // -----------------------------------------------------------------------------
 
-/// Check whether a method + path pair matches a known Responses API endpoint.
-///
-/// Returns `true` for:
-/// - `GET    /v1/responses/{id}`
-/// - `GET    /v1/responses/{id}/input_items`
-/// - `POST   /v1/responses/{id}/cancel`
-/// - `POST   /v1/responses/input_tokens`
-/// - `POST   /v1/responses/compact`
-/// - `DELETE /v1/responses/{id}`
-pub(crate) fn is_responses_path(method: &http::Method, path: &str) -> bool {
-    let path = normalize_trailing_slash(path);
-    let rest = match path.strip_prefix("/v1/responses/") {
-        Some(r) if !r.is_empty() => r,
-        _ => return false,
-    };
-
-    match *method {
-        http::Method::POST => {
-            matches!(rest, "input_tokens" | "compact")
-                || rest
-                    .strip_suffix("/cancel")
-                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-        },
-        http::Method::GET => {
-            !rest.contains('/')
-                || rest
-                    .strip_suffix("/input_items")
-                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-        },
-        http::Method::DELETE => !rest.contains('/'),
-        _ => false,
-    }
-}
-
 /// Check whether a method + path pair is the Responses API create endpoint.
 ///
 /// Returns `true` only for `POST /v1/responses` (with optional trailing slash).
@@ -127,34 +117,14 @@ pub(crate) fn is_responses_create(method: &http::Method, path: &str) -> bool {
     method == http::Method::POST && normalize_trailing_slash(path) == "/v1/responses"
 }
 
-/// Check whether a request is a Responses API `WebSocket` handshake.
+/// Check whether a method + path pair is the Chat Completions create endpoint.
 ///
-/// The handshake uses `GET /v1/responses` and the opening handshake from
-/// [RFC 6455 Section 4.1]. `Connection` options follow the token-list
-/// semantics in [RFC 9110 Section 7.6.1], including comma-separated and
-/// repeated field lines.
-///
-/// [RFC 6455 Section 4.1]: https://datatracker.ietf.org/doc/html/rfc6455#section-4.1
-/// [RFC 9110 Section 7.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1
-pub(crate) fn is_responses_websocket_handshake(method: &http::Method, path: &str, headers: &http::HeaderMap) -> bool {
-    if method != http::Method::GET || normalize_trailing_slash(path) != "/v1/responses" {
-        return false;
-    }
-
-    let connection_upgrades = headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
-    let mut upgrade_values = headers.get_all(http::header::UPGRADE).iter();
-    let upgrades_to_websocket = upgrade_values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("websocket"))
-        && upgrade_values.next().is_none();
-
-    connection_upgrades && upgrades_to_websocket
+/// Returns `true` only for `POST /v1/chat/completions`. Kept separate from
+/// [`is_responses_create`] so Responses API filters keep their current endpoint
+/// semantics; only filters that are genuinely endpoint-agnostic, such as
+/// `openai_responses_model_rewrite`, accept both.
+pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> bool {
+    method == http::Method::POST && path == "/v1/chat/completions"
 }
 
 // -----------------------------------------------------------------------------
@@ -178,6 +148,32 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
         return empty_result(AiRequestFormat::InvalidJson);
     };
 
+    // This parse is a throwaway owned by this function, so the model string is
+    // moved out rather than copied.
+    let model = take_string(obj, "model");
+    classify_fields(obj, model)
+}
+
+/// Extract routing facts from an already-parsed request object.
+///
+/// Callers that parsed the body for their own reasons use this instead of
+/// [`classify_request_body`], so one request is deserialized once rather than
+/// once per consumer.
+///
+/// Borrows the object rather than taking ownership of fields out of it: a
+/// caller that reuses the same parsed value afterwards — to build request
+/// state, say — must still see the body the client actually sent. That costs
+/// one copy of the model string, which the owned path above avoids.
+pub(crate) fn classify_object(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
+    let model = copy_string(obj, "model");
+    classify_fields(obj, model)
+}
+
+/// Extract the remaining facts once the model has been obtained.
+///
+/// Split out so the owned and borrowed entry points differ only in how they
+/// get the model string, and cannot otherwise drift.
+fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Option<String>) -> ClassifiedRequest {
     let format = classify_format(obj);
 
     ClassifiedRequest {
@@ -195,7 +191,7 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
         max_output_tokens: obj.get("max_output_tokens").and_then(serde_json::Value::as_u64),
         max_tokens: obj.get("max_tokens").and_then(serde_json::Value::as_u64),
-        model: take_string(obj, "model"),
+        model,
         store: obj.get("store").and_then(serde_json::Value::as_bool),
         stream: obj.get("stream").and_then(serde_json::Value::as_bool),
     }
@@ -289,12 +285,28 @@ pub(crate) fn empty_result(format: AiRequestFormat) -> ClassifiedRequest {
 /// Take a string field out of a JSON object, converting numbers/booleans
 /// to their string representation.
 ///
-/// Moves the owned `String` out of the parsed body instead of cloning it,
-/// leaving an empty string in its place. Callers must not read `key` again
-/// afterwards.
+/// Moves the owned `String` out of the parsed body instead of copying it,
+/// leaving an empty string in its place. Only for a parse the caller owns and
+/// discards; `copy_string` is the variant for a shared parse, and only
+/// exists when the Responses filters that share a parse are compiled in.
 fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get_mut(key).and_then(|v| match v {
         serde_json::Value::String(s) => Some(std::mem::take(s)),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
+/// Copy a string field out of a JSON object, converting numbers/booleans to
+/// their string representation.
+///
+/// Copies rather than moves, because the caller reuses the same parsed value
+/// afterwards. Moving would leave an empty string behind and forward a request
+/// the client never sent.
+fn copy_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
@@ -317,6 +329,30 @@ fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) 
     reason = "tests"
 )]
 mod tests {
+
+    #[test]
+    fn the_owned_path_moves_the_model_out_of_its_throwaway_parse() {
+        let body = br#"{"model":"gpt-4.1","input":"hi"}"#;
+        assert_eq!(classify_request_body(body).model.as_deref(), Some("gpt-4.1"));
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn the_borrowed_path_leaves_the_caller_s_value_intact() {
+        // A shared parse is reused afterwards to build request state, so the
+        // model must survive classification rather than be moved out.
+        let mut value: serde_json::Value = serde_json::from_slice(br#"{"model":"gpt-4.1","input":"hi"}"#).unwrap();
+        let obj = value.as_object_mut().unwrap();
+
+        let classified = classify_object(obj);
+
+        assert_eq!(classified.model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            obj.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-4.1"),
+            "classification must not empty the caller's model field"
+        );
+    }
     use super::*;
 
     #[test]
@@ -809,252 +845,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Path Classification
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn get_v1_responses_list_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/responses"),
-            "GET /v1/responses is not a public API endpoint"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_with_id_matches() {
-        assert!(
-            is_responses_path(&http::Method::GET, "/v1/responses/resp_abc123"),
-            "GET /v1/responses/{{id}} should match"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_input_items_matches() {
-        assert!(
-            is_responses_path(&http::Method::GET, "/v1/responses/resp_abc123/input_items"),
-            "GET /v1/responses/{{id}}/input_items should match"
-        );
-    }
-
-    #[test]
-    fn delete_v1_responses_with_id_matches() {
-        assert!(
-            is_responses_path(&http::Method::DELETE, "/v1/responses/resp_abc123"),
-            "DELETE /v1/responses/{{id}} should match"
-        );
-    }
-
-    #[test]
-    fn post_v1_responses_cancel_matches() {
-        assert!(
-            is_responses_path(&http::Method::POST, "/v1/responses/resp_abc123/cancel"),
-            "POST /v1/responses/{{id}}/cancel should match"
-        );
-    }
-
-    #[test]
-    fn post_v1_responses_input_tokens_matches() {
-        assert!(
-            is_responses_path(&http::Method::POST, "/v1/responses/input_tokens"),
-            "POST /v1/responses/input_tokens should match"
-        );
-    }
-
-    #[test]
-    fn post_v1_responses_compact_matches() {
-        assert!(
-            is_responses_path(&http::Method::POST, "/v1/responses/compact"),
-            "POST /v1/responses/compact should match"
-        );
-    }
-
-    #[test]
-    fn post_v1_responses_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::POST, "/v1/responses"),
-            "POST /v1/responses (create) should not match path classification"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_cancel_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/responses/resp_abc/cancel"),
-            "GET /v1/responses/{{id}}/cancel should not match"
-        );
-    }
-
-    #[test]
-    fn delete_v1_responses_list_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::DELETE, "/v1/responses"),
-            "DELETE /v1/responses (no id) should not match"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_unknown_sub_resource_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/responses/resp_abc/other"),
-            "GET /v1/responses/{{id}}/other should not match"
-        );
-    }
-
-    #[test]
-    fn get_unrelated_path_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/chat/completions"),
-            "GET /v1/chat/completions should not match"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_trailing_slash_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/responses/"),
-            "GET /v1/responses/ is not a public API endpoint"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Responses WebSocket Handshake Classification
-    // -------------------------------------------------------------------------
-
-    /// Accept the canonical Responses opening handshake.
-    #[test]
-    fn responses_websocket_handshake_matches_standard_upgrade() {
-        let headers = websocket_headers("Upgrade", "websocket");
-
-        assert!(
-            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &headers),
-            "the canonical Responses WebSocket handshake should match"
-        );
-    }
-
-    /// Treat protocol tokens case-insensitively and normalize a trailing slash.
-    #[test]
-    fn responses_websocket_handshake_is_case_insensitive_and_allows_trailing_slash() {
-        let headers = websocket_headers("keep-alive, UpGrAdE", "WebSocket");
-
-        assert!(
-            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses/", &headers),
-            "field tokens should ignore case and the endpoint should allow a trailing slash"
-        );
-    }
-
-    /// Find an upgrade token across repeated `Connection` field lines.
-    #[test]
-    fn responses_websocket_handshake_finds_token_across_repeated_connection_headers() {
-        let mut headers = websocket_headers("keep-alive", "websocket");
-        headers.append(http::header::CONNECTION, "upgrade".parse().unwrap());
-
-        assert!(
-            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &headers),
-            "a repeated Connection field should contribute its upgrade token"
-        );
-    }
-
-    /// Limit handshake classification to the exact Responses endpoint and method.
-    #[test]
-    fn responses_websocket_handshake_rejects_wrong_method_or_path() {
-        let headers = websocket_headers("upgrade", "websocket");
-
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::POST, "/v1/responses", &headers),
-            "a POST request is not a WebSocket opening handshake"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses/resp_123", &headers),
-            "a response subresource must not match the opening endpoint"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/chat/completions", &headers),
-            "an unrelated API endpoint must not match"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses-other", &headers),
-            "a path that merely shares the Responses prefix must not match"
-        );
-    }
-
-    /// Require both HTTP upgrade fields before classifying a handshake.
-    #[test]
-    fn responses_websocket_handshake_requires_both_upgrade_headers() {
-        let mut connection_only = http::HeaderMap::new();
-        connection_only.insert(http::header::CONNECTION, "upgrade".parse().unwrap());
-        let mut upgrade_only = http::HeaderMap::new();
-        upgrade_only.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &connection_only),
-            "Connection alone must not classify a WebSocket handshake"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &upgrade_only),
-            "Upgrade alone must not classify a WebSocket handshake"
-        );
-    }
-
-    /// Reject lookalike tokens, other protocols, and ambiguous upgrade fields.
-    #[test]
-    fn responses_websocket_handshake_rejects_non_websocket_upgrade_and_substring_token() {
-        let wrong_upgrade = websocket_headers("upgrade", "h2c");
-        let substring_connection = websocket_headers("upgrader", "websocket");
-        let mut repeated_upgrade = websocket_headers("upgrade", "websocket");
-        repeated_upgrade.append(http::header::UPGRADE, "h2c".parse().unwrap());
-
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &wrong_upgrade),
-            "an h2c upgrade must not classify as WebSocket"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &substring_connection),
-            "an upgrade substring must not match the Connection token"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &repeated_upgrade),
-            "multiple Upgrade field lines are ambiguous and must not match"
-        );
-    }
-
-    /// Reject field values that cannot contain valid UTF-8 protocol tokens.
-    #[test]
-    fn responses_websocket_handshake_rejects_non_utf8_upgrade_headers() {
-        let mut invalid_connection = websocket_headers("upgrade", "websocket");
-        invalid_connection.insert(
-            http::header::CONNECTION,
-            http::HeaderValue::from_bytes(&[0xFF]).unwrap(),
-        );
-        let mut invalid_upgrade = websocket_headers("upgrade", "websocket");
-        invalid_upgrade.insert(http::header::UPGRADE, http::HeaderValue::from_bytes(&[0xFF]).unwrap());
-
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &invalid_connection),
-            "a non-UTF-8 Connection value cannot contain a valid upgrade token"
-        );
-        assert!(
-            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &invalid_upgrade),
-            "a non-UTF-8 Upgrade value cannot identify the WebSocket protocol"
-        );
-    }
-
-    #[test]
-    fn delete_v1_responses_input_items_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::DELETE, "/v1/responses/resp_abc/input_items"),
-            "DELETE /v1/responses/{{id}}/input_items should not match"
-        );
-    }
-
-    #[test]
-    fn get_v1_responses_double_slash_input_items_does_not_match() {
-        assert!(
-            !is_responses_path(&http::Method::GET, "/v1/responses//input_items"),
-            "GET /v1/responses//input_items should not collapse empty id segment"
-        );
-    }
-
-    // -------------------------------------------------------------------------
     // Create-Endpoint Classification
     // -------------------------------------------------------------------------
 
@@ -1111,6 +901,54 @@ mod tests {
         assert!(
             !is_responses_create(&http::Method::POST, "/v1/chat/completions"),
             "POST /v1/chat/completions should not match create"
+        );
+    }
+
+    #[test]
+    fn chat_create_matches_post_v1_chat_completions() {
+        assert!(
+            is_chat_completions_create(&http::Method::POST, "/v1/chat/completions"),
+            "POST /v1/chat/completions should match chat create"
+        );
+    }
+
+    #[test]
+    fn chat_create_rejects_post_v1_chat_completions_trailing_slash() {
+        assert!(
+            !is_chat_completions_create(&http::Method::POST, "/v1/chat/completions/"),
+            "POST /v1/chat/completions/ should not match chat create"
+        );
+    }
+
+    #[test]
+    fn chat_create_rejects_get() {
+        assert!(
+            !is_chat_completions_create(&http::Method::GET, "/v1/chat/completions"),
+            "GET /v1/chat/completions should not match chat create"
+        );
+    }
+
+    #[test]
+    fn chat_create_rejects_responses() {
+        assert!(
+            !is_chat_completions_create(&http::Method::POST, "/v1/responses"),
+            "POST /v1/responses should not match chat create"
+        );
+    }
+
+    #[test]
+    fn chat_create_rejects_legacy_completions() {
+        assert!(
+            !is_chat_completions_create(&http::Method::POST, "/v1/completions"),
+            "POST /v1/completions should not match chat create"
+        );
+    }
+
+    #[test]
+    fn chat_create_rejects_subresource() {
+        assert!(
+            !is_chat_completions_create(&http::Method::POST, "/v1/chat/completions/chatcmpl_abc"),
+            "POST /v1/chat/completions/{{id}} should not match chat create"
         );
     }
 
@@ -1197,16 +1035,5 @@ mod tests {
             Some("bad\nmodel"),
             "model with control chars should still be extracted by classifier"
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // Test Utilities
-    // -------------------------------------------------------------------------
-
-    fn websocket_headers(connection: &'static str, upgrade: &'static str) -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONNECTION, connection.parse().unwrap());
-        headers.insert(http::header::UPGRADE, upgrade.parse().unwrap());
-        headers
     }
 }

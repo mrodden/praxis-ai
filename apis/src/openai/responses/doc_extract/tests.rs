@@ -65,7 +65,33 @@ fn raw_base64(text: &str) -> String {
 }
 
 fn set_responses_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+}
+
+#[test]
+fn history_extraction_detaches_only_document_and_preserves_persisted_order() {
+    let original = vec![
+        serde_json::json!({"type": "message", "role": "assistant", "content": "legacy plain text"}),
+        serde_json::json!({"type": "message", "role": "user", "content": [
+            {"type": "input_file", "file_data": text_file_data("document text")}
+        ]}),
+        serde_json::json!({"type": "function_call", "name": "lookup", "arguments": "{}"}),
+    ];
+    let persisted = MessageHistory::from(original.clone());
+    let mut replay = persisted.clone();
+    let mut budget = ExtractionBudget::new(&make_filter().config);
+    extract_history(&mut replay, 3, &mut budget).unwrap();
+    assert_eq!(
+        serde_json::to_value(&persisted).unwrap(),
+        serde_json::Value::Array(original)
+    );
+    assert_eq!(replay[1]["content"][0]["type"], "input_text");
+    assert_eq!(replay[1]["content"][0]["text"], "document text");
+    let original_handles: Vec<_> = persisted.shared_items().collect();
+    let replay_handles: Vec<_> = replay.shared_items().collect();
+    assert!(std::sync::Arc::ptr_eq(original_handles[0], replay_handles[0]));
+    assert!(!std::sync::Arc::ptr_eq(original_handles[1], replay_handles[1]));
+    assert!(std::sync::Arc::ptr_eq(original_handles[2], replay_handles[2]));
 }
 
 // -- Config tests -------------------------------------------------------------
@@ -132,13 +158,10 @@ fn from_config_zero_max_content_bytes_rejected() {
 // -- Body access tests --------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadWrite,
-        "doc_extract needs ReadWrite to rewrite the body"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]

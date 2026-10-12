@@ -11,13 +11,62 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationRecord, PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-        SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
 };
 
 fn default_filter() -> RehydrateFilter {
     RehydrateFilter
+}
+
+#[test]
+fn replay_shares_canonical_items_and_copies_only_legacy_normalization() {
+    let canonical = vec![
+        json!({"type": "message", "role": "user", "content": "hello"}),
+        json!({"type": "item_reference", "id": "msg_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+        json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque"}),
+        json!({"type": "function_call", "call_id": "call_1", "name": "weather", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "sunny"}),
+    ];
+    let mut persisted = MessageHistory::from(canonical.clone());
+    persisted.insert(
+        1,
+        json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+    );
+    persisted.push(json!({"role": "assistant", "content": "legacy answer"}));
+    persisted.push(json!({"id": "legacy_reference"}));
+    let original = persisted.clone();
+
+    let replay = replay_messages_from_stored(&persisted);
+
+    assert_eq!(replay.len(), canonical.len() + 2);
+    assert_eq!(persisted.len(), canonical.len() + 3);
+    for (index, expected) in canonical.iter().enumerate() {
+        let persisted_index = if index == 0 { 0 } else { index + 1 };
+        assert_eq!(replay[index], *expected);
+        assert!(
+            replay.shares_item_with(index, &persisted, persisted_index),
+            "canonical item {index} must not be cloned during replay"
+        );
+    }
+    assert_eq!(
+        replay[6],
+        json!({"type": "message", "role": "assistant", "content": "legacy answer"})
+    );
+    assert_eq!(replay[7], json!({"type": "item_reference", "id": "legacy_reference"}));
+    assert!(!replay.shares_item_with(6, &persisted, 7));
+    assert!(!replay.shares_item_with(7, &persisted, 8));
+    assert_eq!(
+        persisted, original,
+        "legacy normalization must not alter exact persisted history"
+    );
+    assert!(persisted[7].get("type").is_none());
+    assert!(persisted[8].get("type").is_none());
+    for index in 0..persisted.len() {
+        assert!(persisted.shares_item_with(index, &original, index));
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -45,13 +94,10 @@ fn unknown_field_rejected() {
 }
 
 #[test]
-fn body_access_is_read_only() {
+fn declares_dual_phase_body_access() {
     let filter = default_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadOnly,
-        "filter should use read-only body access"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 // -----------------------------------------------------------------------------
@@ -74,7 +120,7 @@ async fn skips_non_responses_format() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
+    ctx.set_metadata("openai_responses_request.format", "openai_chat_completions");
     let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -103,7 +149,7 @@ async fn skips_cancel_request_without_parsing_empty_body() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_123/cancel");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::new());
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -127,7 +173,7 @@ async fn passthrough_when_no_previous_response_id() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"model":"gpt-4.1","input":"Hello"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -152,7 +198,7 @@ async fn passthrough_when_previous_response_id_is_null() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hello","previous_response_id":null}"#,
     ));
@@ -181,7 +227,7 @@ async fn validates_previous_response_and_sets_metadata() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.set_metadata("responses.response_id", "resp_current");
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
@@ -238,7 +284,7 @@ async fn store_persist_armed_survives_rehydrate_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     // The store filter arms persistence earlier in the request phase; rehydrate
     // replaces ResponsesState and must not drop that exchange-scoped marker, or a
     // continuation-turn approval would be falsely rejected as unresumable.
@@ -279,7 +325,7 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(ResponsesState {
         store_persist_armed: true,
         ..Default::default()
@@ -302,6 +348,104 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
         state.store_persist_armed,
         "conversation rehydrate must also preserve the persistence-armed marker"
     );
+}
+
+#[tokio::test]
+async fn sqlite_item_history_rehydrates_complete_order_after_delete_and_append_at_bound_seam() {
+    let (db_url, db_path) = temp_sqlite_url("rehydrate_item_history");
+    let store = SqliteResponseStore::new(
+        &db_url,
+        "test_responses",
+        "test_conversations",
+        Some("test_items"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let owner = crate::test_utils::test_owner("default");
+    ConversationItemStore::upsert_conversation(
+        &store,
+        &ConversationRecord {
+            conversation_id: "conv_items".to_owned(),
+            owner: owner.clone(),
+            created_at: 1000,
+            metadata: json!({}),
+            messages: json!([]),
+        },
+    )
+    .await
+    .unwrap();
+    let item = |index: usize| ConversationItemRecord {
+        item_id: format!("msg_{index}"),
+        owner: owner.clone(),
+        conversation_id: "conv_items".to_owned(),
+        item_data: json!({"id": format!("msg_{index}"), "type": "message", "role": "user", "content": format!("turn {index}")}),
+        created_at: 1000,
+        position: 0,
+    };
+    let initial: Vec<_> = (0..125).map(&item).collect();
+    store
+        .create_items_and_sync_messages(&owner, "conv_items", &initial)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .delete_item_and_sync_messages(&owner, "conv_items", "msg_62")
+            .await
+            .unwrap()
+    );
+    let appended: Vec<_> = (125..128).map(item).collect();
+    store
+        .create_items_and_sync_messages(&owner, "conv_items", &appended)
+        .await
+        .unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&Arc::from("default"), Arc::new(store)).unwrap();
+    let expected: Vec<_> = initial
+        .into_iter()
+        .chain(appended)
+        .filter(|record| record.item_id != "msg_62")
+        .map(|record| record.item_data)
+        .collect();
+
+    for truncation in ["auto", "disabled"] {
+        let filter = default_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        ctx.set_metadata("openai_responses_request.format", "openai_responses");
+        let original = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4.1", "input": "next", "conversation": "conv_items", "truncation": truncation
+            }))
+            .unwrap(),
+        );
+        let mut body = Some(original.clone());
+        let outcome = filter
+            .on_bound_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+        assert_eq!(body.as_ref(), Some(&original));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert!(state.history_rehydrated);
+        assert_eq!(state.request_body["truncation"], truncation);
+        assert_eq!(state.messages.len(), expected.len() + 1);
+        assert!(state.messages.iter().take(expected.len()).eq(expected.iter()));
+        assert!(state.persisted_messages.iter().take(expected.len()).eq(expected.iter()));
+        for index in 0..state.messages.len() {
+            assert!(
+                state.messages.shares_item_with(index, &state.persisted_messages, index),
+                "canonical history item {index} must share its replay and persistence allocation"
+            );
+        }
+        assert_eq!(state.persisted_messages.len(), expected.len() + 1);
+        assert_eq!(state.messages.last().unwrap()["content"], "next");
+        assert_eq!(state.persisted_messages.last().unwrap()["content"], "next");
+    }
+    drop(registry);
+    cleanup_sqlite_file(&db_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -333,25 +477,43 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
-- filter: openai_response_store
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
+- filter: openai_responses_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
 - filter: openai_responses_rehydrate
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    // The store is provisioned into the registry outside the filter; back it by
+    // the same file the previous response was seeded into so rehydrate finds it.
+    let provisioned = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
+        .await
+        .unwrap();
+    let store_registry = ResponseStoreRegistry::new();
+    store_registry
+        .register(&Arc::from("default"), Arc::new(provisioned))
+        .unwrap();
+    pipeline.add_pipeline_extension(Box::new(store_registry));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     pipeline.prepare_extensions(&mut ctx.extensions);
-
-    drop(pipeline.execute_http_request(&mut ctx).await.unwrap());
 
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
@@ -362,7 +524,14 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
         .unwrap();
     assert!(
         matches!(action, FilterAction::Release),
-        "on_request should register store so rehydrate finds it in on_request_body"
+        "format classification should release the canonical pre-read body"
+    );
+    ctx.buffered_request_body = body.clone();
+
+    let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(request_action, FilterAction::Continue),
+        "binding should run the bound-body store and rehydrate hooks"
     );
 
     assert_eq!(
@@ -409,7 +578,7 @@ async fn rejects_when_previous_response_not_found() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_missing"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -431,7 +600,7 @@ async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
     let mut wrong_ctx = crate::test_utils::make_filter_context(&req);
     wrong_ctx.extensions.insert(other);
     wrong_ctx.extensions.insert(registry.clone());
-    wrong_ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    wrong_ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(request_body));
     let rejection = match filter.on_request_body(&mut wrong_ctx, &mut body, true).await.unwrap() {
         FilterAction::Reject(rejection) => rejection,
@@ -443,7 +612,7 @@ async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
     let mut owner_ctx = crate::test_utils::make_filter_context(&req);
     owner_ctx.extensions.insert(owner);
     owner_ctx.extensions.insert(registry);
-    owner_ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    owner_ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(request_body));
     let action = filter.on_request_body(&mut owner_ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Release));
@@ -459,7 +628,7 @@ async fn rejects_when_status_not_completed() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -478,7 +647,7 @@ async fn rejects_when_status_incomplete() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -497,7 +666,7 @@ async fn rejects_when_status_failed() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -512,7 +681,7 @@ async fn rejects_when_store_unavailable() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -530,7 +699,7 @@ async fn rejects_when_store_not_registered() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -545,7 +714,7 @@ async fn rejects_invalid_json_body() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from("not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -560,7 +729,7 @@ async fn rejects_non_string_previous_response_id() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":123}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -579,7 +748,7 @@ async fn rejects_when_store_fetch_fails() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -598,7 +767,7 @@ async fn rejects_when_conversation_store_fails() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
     ));
@@ -637,7 +806,7 @@ async fn extracts_mcp_tools_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"Follow up","previous_response_id":"resp_mcp"}"#,
     ));
@@ -691,7 +860,7 @@ async fn no_previous_tools_when_output_has_no_mcp_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_no_mcp"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -736,7 +905,7 @@ async fn extracts_mcp_tools_from_multiple_servers() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_multi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -813,7 +982,7 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_dedupe"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -831,6 +1000,30 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
         1,
         "ResponsesState should not retain duplicate MCP listings"
     );
+}
+
+#[test]
+fn retains_private_mcp_targets_with_identical_tool_names() {
+    let a = "https://a.example/mcp";
+    let b = "https://b.example/mcp";
+    let record = ResponseRecord {
+        id: "resp_targets".to_owned(),
+        owner: crate::test_utils::test_owner("default"),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({
+            "output": [{"type": "mcp_list_tools", "server_label": "weather", "tools": [{"name": "shared_tool"}]}]
+        }),
+        input: json!("Hi"),
+        messages: json!([
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": a, "tools": [{"name": "shared_tool"}]},
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": b, "tools": [{"name": "shared_tool"}]}
+        ]),
+    };
+    let listings = collect_mcp_tool_listings(&record);
+    assert!(listings.iter().any(|item| item["server_url"] == a));
+    assert!(listings.iter().any(|item| item["server_url"] == b));
+    assert!(listings.iter().all(|item| item["tools"][0]["name"] == "shared_tool"));
 }
 
 #[tokio::test]
@@ -874,7 +1067,7 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"Third turn","previous_response_id":"resp_chain"}"#,
     ));
@@ -913,6 +1106,19 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
         state.persisted_messages[1]["type"], "mcp_list_tools",
         "persistence history should preserve stored MCP metadata"
     );
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "only the hosted listing is excluded from replay"
+    );
+    for (replay_index, persisted_index) in [(0, 0), (1, 2), (2, 3)] {
+        assert!(
+            state
+                .messages
+                .shares_item_with(replay_index, &state.persisted_messages, persisted_index),
+            "canonical items must remain shared even when hosted metadata shifts replay positions"
+        );
+    }
 }
 
 #[tokio::test]
@@ -933,7 +1139,7 @@ async fn large_mcp_tool_listing_is_preserved_in_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_big"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -972,7 +1178,7 @@ async fn extracts_usage_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_usage"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1017,7 +1223,7 @@ async fn no_usage_metadata_when_usage_missing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_no_usage"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1059,7 +1265,7 @@ async fn extracts_partial_usage_fields() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_partial"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1125,7 +1331,7 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_mcp_fb"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1181,12 +1387,56 @@ fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
     ];
 
     assert_eq!(
-        replay_messages_from_stored(&stored),
+        replay_messages_from_stored(&stored.into()),
         vec![
             json!({"id":"item-1","type":"item_reference"}),
             json!({"id":"item-2","type":"item_reference"}),
             json!({"id":"msg-1","type":"message","role":"assistant","content":"answer"}),
         ]
+    );
+}
+
+#[test]
+fn rehydration_preserves_provider_compaction_provenance_only() {
+    let stored = vec![
+        json!({
+            "type": "compaction",
+            "id": "compact_local",
+            "encrypted_content": "local",
+            "_praxis_local_compaction": true
+        }),
+        json!({
+            "type": "compaction",
+            "id": "compact_legacy",
+            "encrypted_content": "legacy-local"
+        }),
+        json!({
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-opaque-state"
+        }),
+    ];
+
+    let state = build_state(
+        json!({
+            "input": [{
+                "type": "compaction",
+                "id": "cmp_current",
+                "encrypted_content": "current-provider-state"
+            }]
+        }),
+        stored,
+        vec![],
+        None,
+    );
+    assert_eq!(
+        state.provider_compaction_ids,
+        HashSet::from(["cmp_current".to_owned(), "cmp_provider".to_owned()])
+    );
+    assert_eq!(state.messages[0]["id"], "compact_local");
+    assert!(
+        state.messages[0].get("_praxis_local_compaction").is_none(),
+        "private provenance must not be sent to the backend"
     );
 }
 
@@ -1226,7 +1476,7 @@ async fn large_history_accepted_without_rejection() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"next","previous_response_id":"resp_big"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1259,7 +1509,7 @@ async fn truncation_setting_preserved_through_rehydration() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"next","previous_response_id":"resp_trunc","truncation":"auto"}"#,
     ));
@@ -1286,6 +1536,32 @@ async fn truncation_setting_preserved_through_rehydration() {
 // Conversation Rehydration
 // -----------------------------------------------------------------------------
 
+/// An explicit null selects no conversation, the same as omitting the field.
+/// Treating it as present rejected a well-formed body: a token-count request
+/// carrying `"conversation": null` was told its conversation value was
+/// malformed.
+#[tokio::test]
+async fn an_explicit_null_conversation_is_treated_as_absent() {
+    let store = MockStore::with_conversation("conv_unused", json!([]));
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"count me","conversation":null}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a null conversation must not be rejected as malformed"
+    );
+}
+
 #[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([
@@ -1299,7 +1575,7 @@ async fn rehydrates_from_conversation_string_id() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.set_metadata("responses.response_id", "resp_conversation");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"turn two","conversation":"conv_abc"}"#,
@@ -1345,7 +1621,7 @@ async fn rehydrates_from_conversation_object_form() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"follow up","conversation":{"id":"conv_obj"}}"#,
     ));
@@ -1381,7 +1657,7 @@ async fn rejects_when_conversation_not_found() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_missing"}"#,
     ));
@@ -1402,7 +1678,7 @@ async fn tenant_mismatch_rejects_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(crate::test_utils::test_owner("tenant_b"));
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
@@ -1432,7 +1708,7 @@ async fn same_tenant_different_owner_rejects_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(
         StateOwner::from_trusted_parts("default", "test-issuer", "other-subject").expect("test owner should be valid"),
     );
@@ -1463,7 +1739,7 @@ async fn rejects_malformed_conversation_empty_object() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":{}}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1482,7 +1758,7 @@ async fn rejects_malformed_conversation_numeric() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":42}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1501,7 +1777,7 @@ async fn empty_conversation_produces_valid_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"first message","conversation":"conv_empty"}"#,
     ));
@@ -1529,7 +1805,7 @@ async fn conversation_rehydration_requires_store_registry() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_123"}"#,
     ));
@@ -1550,7 +1826,7 @@ async fn conversation_null_messages_treated_as_empty() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"test","conversation":"conv_null_msgs"}"#,
     ));
@@ -1571,7 +1847,6 @@ async fn conversation_null_messages_treated_as_empty() {
         "null conversation messages should contribute zero stored items"
     );
 }
-
 
 // -----------------------------------------------------------------------------
 // Response-side previous_response_id restore (issue #932)
@@ -3503,6 +3778,36 @@ impl ResponseStore for MockStore {
         Ok(Vec::new())
     }
 
+    async fn append_events(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        // Rehydration never writes the event log; this stub satisfies the trait.
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _after: Option<u64>,
+        _limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        // Rehydration never replays the event log; this stub satisfies the trait.
+        Ok(Vec::new())
+    }
+
+    async fn event_log_status(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        // Rehydration never inspects the event log; this stub satisfies the trait.
+        Ok(EventLogStatus::default())
+    }
+
     async fn get_conversation(
         &self,
         tenant_id: &StateOwner,
@@ -3546,4 +3851,170 @@ fn cleanup_sqlite_file(db_path: &std::path::Path) {
     drop(std::fs::remove_file(db_path));
     drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
+}
+
+/// Read the complete cache-only array from the response-store fixture,
+/// preserving its owner checks and failure behavior. Item writes and item-level
+/// reads remain unsupported.
+#[async_trait::async_trait]
+impl ConversationItemStore for MockStore {
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<Value>>, StoreError> {
+        ResponseStore::get_conversation(self, owner, conversation_id)
+            .await?
+            .map(|record| match record.messages {
+                Value::Array(messages) => Ok(messages),
+                Value::Null => Ok(Vec::new()),
+                _ => Err(StoreError::Serialization("invalid mock history array".to_owned())),
+            })
+            .transpose()
+    }
+
+    async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _metadata: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &Value,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        ResponseStore::get_conversation(self, owner, conversation_id).await
+    }
+
+    async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<i64, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
 }

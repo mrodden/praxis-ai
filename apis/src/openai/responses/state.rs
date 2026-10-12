@@ -13,13 +13,42 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    ops::RangeInclusive,
     time::Duration,
 };
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
+use super::{
+    bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response,
+    history::MessageHistory,
+};
+
+/// Internal persisted field identifying a Praxis-generated compaction item.
+///
+/// This field is stored only in the private rehydration history. The outbound
+/// serializer removes it before any item reaches a provider or client.
+pub(crate) const LOCAL_COMPACTION_MARKER: &str = "_praxis_local_compaction";
+
+/// Mark a locally generated compaction item in private persisted history.
+#[cfg(feature = "openai-compact")]
+pub(crate) fn mark_local_compaction_item(item: &serde_json::Value) -> serde_json::Value {
+    let mut marked = item.clone();
+    if let Some(object) = marked.as_object_mut() {
+        object.insert(LOCAL_COMPACTION_MARKER.to_owned(), serde_json::Value::Bool(true));
+    }
+    marked
+}
+
+/// Remove private provenance metadata before replaying a stored item.
+#[cfg(feature = "store")]
+pub(crate) fn strip_local_compaction_marker(mut item: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = item.as_object_mut() {
+        object.remove(LOCAL_COMPACTION_MARKER);
+    }
+    item
+}
 
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
@@ -37,7 +66,7 @@ pub(crate) enum SynthesisKind {
 }
 
 /// One `file_search_call` the parse owner (`openai_agentic_loop`) accumulated
-/// this round and handed to `openai_file_search_callout` for execution.
+/// this round and handed to `openai_file_search_dispatch` for execution.
 ///
 /// The owner is the sole parser: it appends the canonical `file_search_call`
 /// output item to [`ResponsesState::accumulated_output`] and records its
@@ -59,7 +88,7 @@ pub(crate) struct FileSearchAssignment {
 
 /// A terminal failure a request-phase dispatcher recorded in shared state.
 ///
-/// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
+/// A dispatcher (e.g. `openai_file_search_dispatch`) never rejects or rewrites a
 /// response itself — that would make it a second terminal-response owner. Instead
 /// it records the failure here and returns `Continue`; the parse owner
 /// (`openai_agentic_loop`), which runs next in the same request phase, converts it
@@ -285,7 +314,7 @@ pub(crate) enum McpApprovalState {
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Created by `openai_responses_validate` for every Responses API
+/// Created by `openai_responses_request` for every Responses API
 /// create request. When `previous_response_id` is present,
 /// `openai_responses_rehydrate` replaces it with an enriched
 /// version that includes conversation history. Uses
@@ -336,7 +365,7 @@ pub(crate) struct ResponsesState {
     /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
     ///
     /// #937: `openai_stream_events` defers the terminal frame until the inner
-    /// IRR stream ends, then surfaces it to the pre-IRR `openai_response_store`
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_responses_store`
     /// as an ordinary non-end-of-stream chunk — ahead of the empty
     /// end-of-stream callback where streaming persistence historically ran. Left
     /// uncoordinated, a client could observe `response.completed` for a record a
@@ -346,14 +375,17 @@ pub(crate) struct ResponsesState {
     /// [`Self::response_object`] and appends that non-end-of-stream terminal
     /// frame, so the store persists synchronously BEFORE releasing the chunk
     /// (failing closed on error) and then skips the redundant end-of-stream
-    /// persist. It is deliberately **not** set for a request-phase local
-    /// completion (`encode_local_completion`): that terminal is delivered as a
-    /// buffered `TerminalResponse` at end-of-stream, where the store already
-    /// persists before the body is written, so marking it here would suppress
-    /// that end-of-stream persist and lose the record.
+    /// persist. A request-phase local completion uses the separate
+    /// [`Self::local_stream_terminal_emitted`] flag because IRR can deliver its
+    /// terminal body as a non-end-of-stream chunk too.
     ///
     /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
     pub logical_stream_terminal_emitted: bool,
+
+    /// A request-phase dispatcher encoded a local `response.completed` frame.
+    /// IRR can deliver this as a non-EOS chunk, so outer persistence filters
+    /// must commit the canonical response before releasing that chunk.
+    pub local_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -458,11 +490,29 @@ pub(crate) struct ResponsesState {
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: MessageHistory,
+
+    /// Start of the newly appended local tool-result suffix that still needs
+    /// guardrail evaluation before another inference request may be built.
+    ///
+    /// Dispatchers set this to the pre-append `messages` length. The guardrail
+    /// handoff drains the marker exactly once and extracts only
+    /// `function_call_output` items from that suffix, so prior conversation
+    /// history is never rescanned. An index keeps the handoff payload-free: the
+    /// canonical result remains owned only by [`Self::messages`].
+    pub pending_local_tool_guardrail_start: Option<usize>,
 
     /// Number of leading messages already persisted by a provider-owned
     /// conversation. Internal continuations send only the remaining delta.
     pub provider_history_len: usize,
+
+    /// IDs of compaction items that came from a provider response.
+    ///
+    /// Locally generated Praxis summaries use the same public JSON shape as a
+    /// provider compaction item, so the outbound proxy must not infer native
+    /// support from the item type alone. Rehydration populates this set from
+    /// persisted provenance metadata; items absent from the set are translated.
+    pub provider_compaction_ids: HashSet<String>,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -477,7 +527,7 @@ pub(crate) struct ResponsesState {
     /// This may include output-only metadata items omitted from
     /// [`Self::messages`] because it is not forwarded to backend
     /// inference.
-    pub persisted_messages: Vec<serde_json::Value>,
+    pub persisted_messages: MessageHistory,
 
     /// Server-owned pending MCP approvals emitted during this request.
     ///
@@ -487,11 +537,11 @@ pub(crate) struct ResponsesState {
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
     #[cfg(feature = "store")]
-    pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
+    pub pending_approvals: Vec<praxis_ai_store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
     ///
-    /// Set by `openai_response_store` during the request phase only after it
+    /// Set by `openai_responses_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
     /// whose response will be persisted. `mcp_dispatch` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
@@ -599,7 +649,7 @@ pub(crate) struct ResponsesState {
 
     /// Absolute indices into [`Self::accumulated_output`] (+ synthesis origin)
     /// of the `file_search_call` items `openai_agentic_loop` accumulated this
-    /// round for `openai_file_search_callout` to execute.
+    /// round for `openai_file_search_dispatch` to execute.
     ///
     /// The parse owner records one [`FileSearchAssignment`] per hosted file-search
     /// call it appended to `accumulated_output` (including private
@@ -630,6 +680,24 @@ pub(crate) struct ResponsesState {
     /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+
+    /// Absolute output ranges from the first item of a translated Chat turn to
+    /// its late reasoning item. Rotate only these ranges when storing replay
+    /// history; wire output stays in its announced order. Kept across IRR rounds
+    /// so adjacent assistant turns cannot be mistaken for a single completion.
+    pub translated_reasoning_replay: Vec<RangeInclusive<usize>>,
+
+    /// Storage assembly uses these round boundaries to reconcile the duplicate
+    /// append: a round's `accumulated_output` span and the `persisted_messages`
+    /// window it occupied (captured BEFORE dispatch appended any tool result) let
+    /// the rebuild drop already-collected items, reinsert the uncollected ones in
+    /// their original round, and keep tool results in place. Empty means no
+    /// collector ran (the non-agentic path), so assembly appends output verbatim.
+    pub collected_rounds: Vec<CollectedRound>,
+
+    /// `(accumulated_output index, persisted_messages index)` for each output item
+    /// a collector persisted. This is the authoritative "already stored" signal.
+    pub collected_output_provenance: Vec<(usize, usize)>,
 
     /// Aggregate wire bytes `openai_stream_events` has charged against its
     /// accumulation budget across every IRR round of this request.
@@ -670,7 +738,7 @@ pub(crate) struct ResponsesState {
     pub locally_executed_output_items: HashSet<String>,
 
     /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
-    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// items `openai_file_search_dispatch` reconciled this round on the streaming
     /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
     /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
     pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,
@@ -756,6 +824,28 @@ pub(crate) struct EmittedItem {
     /// IRR response can reach tens of MiB across rounds, so keeping a second full
     /// copy per item here would be payload-scale memory amplification.
     pub content_digest: u64,
+}
+
+/// Boundaries of one agentic round an output collector processed, in both the
+/// `accumulated_output` and `persisted_messages` coordinate spaces.
+///
+/// Recorded for every round the collector saw — including a round that persisted
+/// no items — so storage assembly can tell an all-`message` round apart from a
+/// round that was never collected. `persisted_end` is the length of
+/// `persisted_messages` at the moment collection finished, captured BEFORE
+/// dispatch appends this round's tool results, so the window names exactly the
+/// round's own output items and reinserted messages land ahead of their results.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CollectedRound {
+    /// Start index of the round's items in `accumulated_output`.
+    pub output_start: usize,
+    /// End (exclusive) index of the round's items in `accumulated_output`.
+    pub output_end: usize,
+    /// Start index of the round's window in `persisted_messages`.
+    pub persisted_start: usize,
+    /// End (exclusive) index of the round's window in `persisted_messages`,
+    /// captured before dispatch appends tool results.
+    pub persisted_end: usize,
 }
 
 /// Internally resolved MCP connector waiting for deferred discovery.
@@ -864,6 +954,7 @@ impl Default for ResponsesState {
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
             logical_stream_terminal_emitted: false,
+            local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
@@ -878,10 +969,12 @@ impl Default for ResponsesState {
             mcp_tool_map: HashMap::new(),
             client_tool_lowering: HashMap::new(),
             client_tool_echo: None,
-            messages: Vec::new(),
+            messages: MessageHistory::default(),
+            pending_local_tool_guardrail_start: None,
             provider_history_len: 0,
+            provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
-            persisted_messages: Vec::new(),
+            persisted_messages: MessageHistory::default(),
             #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
@@ -905,6 +998,9 @@ impl Default for ResponsesState {
             tools: Vec::new(),
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
+            translated_reasoning_replay: Vec::new(),
+            collected_rounds: Vec::new(),
+            collected_output_provenance: Vec::new(),
             stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
@@ -920,9 +1016,13 @@ impl ResponsesState {
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
+        let input = messages.clone();
+        let messages = MessageHistory::from(messages);
         let persisted_messages = messages.clone();
+        let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
         let tool_choice = body
             .get("tool_choice")
+            .filter(|v| !v.is_null())
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 
@@ -931,10 +1031,11 @@ impl ResponsesState {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
-            input: messages.clone(),
+            input,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
+            provider_compaction_ids,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
@@ -947,6 +1048,26 @@ impl ResponsesState {
         }
     }
 
+    /// Identify opaque provider compaction items already present in a stateless
+    /// input array. Locally generated summaries use the `compact_` ID prefix or
+    /// carry the private provenance marker and must still be translated.
+    #[expect(
+        single_use_lifetimes,
+        reason = "generic item borrow keeps the signature usable for both contiguous slices and shared history"
+    )]
+    pub(crate) fn provider_compaction_ids_from_messages<'a>(
+        messages: impl IntoIterator<Item = &'a serde_json::Value>,
+    ) -> HashSet<String> {
+        messages
+            .into_iter()
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+            .filter(|item| item.get(LOCAL_COMPACTION_MARKER).and_then(serde_json::Value::as_bool) != Some(true))
+            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.starts_with("compact_"))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
     /// Record the first security-context failure; later calls are ignored (first wins).
     pub(crate) fn record_security_failure(&mut self, failure: DispatchFailure) {
         if self.security_failure.is_none() {
@@ -957,6 +1078,53 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
+    /// Mark a suffix containing newly appended local tool results.
+    ///
+    /// Multiple dispatchers run before the guardrail filter, so retain the
+    /// earliest start and evaluate their combined suffix once.
+    pub(crate) fn mark_local_tool_results_from(&mut self, start: usize) {
+        self.pending_local_tool_guardrail_start = Some(
+            self.pending_local_tool_guardrail_start
+                .map_or(start, |current| current.min(start)),
+        );
+    }
+
+    /// Persist one collected output item to the durable history, recording the
+    /// `(accumulated_output index, persisted_messages index)` provenance in
+    /// lockstep so storage assembly can drop the later wholesale append of the
+    /// same item without guessing by value.
+    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: serde_json::Value) {
+        self.collected_output_provenance
+            .push((accumulated_index, self.persisted_messages.len()));
+        self.persisted_messages.push(item);
+    }
+
+    /// Arc-sharing variant of [`Self::persist_collected_output`]: record the same
+    /// `(accumulated_output index, persisted_messages index)` provenance while
+    /// sharing a single allocation with the replay projection instead of cloning
+    /// the item into durable history.
+    pub(crate) fn persist_collected_output_shared(
+        &mut self,
+        accumulated_index: usize,
+        item: std::sync::Arc<serde_json::Value>,
+    ) {
+        self.collected_output_provenance
+            .push((accumulated_index, self.persisted_messages.len()));
+        self.persisted_messages.push_shared(item);
+    }
+
+    /// Record one agentic round's boundaries after a collector finished it, before
+    /// dispatch appends any tool result. `persisted_start`/`output_start` are the
+    /// lengths captured when the round began collecting.
+    pub(crate) fn record_collected_round(&mut self, output_start: usize, persisted_start: usize) {
+        self.collected_rounds.push(CollectedRound {
+            output_start,
+            output_end: self.accumulated_output.len(),
+            persisted_start,
+            persisted_end: self.persisted_messages.len(),
+        });
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
@@ -999,7 +1167,7 @@ impl ResponsesState {
     /// `openai_client_tool_compat` lowers rich client tools into
     /// `request_body["tools"]` **only**, leaving canonical [`Self::tools`] holding
     /// the original rich types for response-side restore. Provider-body consumers
-    /// (`openai_responses_proxy`, `responses_to_chat_completions`) must read the
+    /// (`openai_responses_proxy`, `openai_responses_to_chat_completions`) must read the
     /// outbound tools through this accessor so they translate the lowered view, not
     /// the canonical rich tools that a function-only backend cannot accept.
     ///
@@ -1090,7 +1258,7 @@ impl ResponsesState {
 
     /// Move the file-search assignment queue out, leaving it empty.
     ///
-    /// `openai_file_search_callout` drains this exactly once at request-body EOS
+    /// `openai_file_search_dispatch` drains this exactly once at request-body EOS
     /// so each assigned `file_search_call` is executed and reconciled a single
     /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
@@ -1228,14 +1396,26 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
 /// a single item object, or an array of items. Normalizes all three
 /// forms to a `Vec<Value>`.
 fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
-    match body.get("input") {
-        Some(serde_json::Value::Array(arr)) => arr.clone(),
-        Some(input @ serde_json::Value::Object(_)) => vec![input.clone()],
-        Some(serde_json::Value::String(s)) => {
+    normalize_input_value(body.get("input"))
+}
+
+/// Normalize one Responses API `input` value into a message array.
+pub(crate) fn normalize_input_value(input: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    input
+        .map(|input| normalize_input_owned(input.clone()))
+        .unwrap_or_default()
+}
+
+/// Normalize an owned `input` value without cloning array or object items.
+pub(crate) fn normalize_input_owned(input: serde_json::Value) -> Vec<serde_json::Value> {
+    match input {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(item) => vec![serde_json::Value::Object(item)],
+        serde_json::Value::String(s) => {
             vec![serde_json::json!({
                 "type": "message",
                 "role": "user",
-                "content": s,
+                "content": s
             })]
         },
         _ => Vec::new(),
@@ -1334,6 +1514,32 @@ mod tests {
         });
         let state = ResponsesState::from_request_body(body);
         assert_eq!(state.input.len(), 2, "array input should preserve all items");
+    }
+
+    #[test]
+    fn from_request_body_records_provider_compaction_ids_for_stateless_chaining() {
+        let provider_item = json!({
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "opaque"
+        });
+        let state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": [provider_item, {
+                "type": "compaction",
+                "id": "compact_local",
+                "encrypted_content": "local"
+            }]
+        }));
+
+        assert!(
+            state.provider_compaction_ids.contains("cmp_provider"),
+            "provider compaction IDs should include opaque provider item IDs"
+        );
+        assert!(
+            !state.provider_compaction_ids.contains("compact_local"),
+            "provider compaction IDs should exclude locally generated compaction IDs"
+        );
     }
 
     #[test]
@@ -2119,7 +2325,7 @@ mod tests {
         // `openai_client_tool_compat` lowers rich client tools into
         // `request_body["tools"]` only, leaving canonical `state.tools` rich. The
         // accessor must return the lowered outbound view so downstream translation
-        // (`responses_to_chat_completions`) sees valid `function` tools.
+        // (`openai_responses_to_chat_completions`) sees valid `function` tools.
         let mut state = ResponsesState::from_request_body(json!({
             "model": "m",
             "tools": [{"type": "custom", "name": "apply_patch"}],

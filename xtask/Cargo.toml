@@ -23,7 +23,6 @@ dev = [
     "dep:praxis-test-utils",
     "dep:quote",
     "dep:reqwest",
-    "dep:serde",
     "dep:serde_yaml",
     "dep:sha2",
     "dep:syn",
@@ -37,6 +36,14 @@ dev = [
 # The previous name of the dev feature set, kept for callers.
 full = ["dev"]
 store-postgres = ["dev", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
+store-postgres-cert-auth = [
+    "dep:praxis-ai",
+    "dep:praxis-ai-apis",
+    "dep:praxis-test-utils",
+    "praxis-ai/store-postgres-cert-auth",
+    "praxis-ai-apis/store-postgres-cert-auth",
+    "praxis-test-utils/store-postgres-cert-auth",
+]
 store-sqlite = ["dev", "praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 
@@ -56,7 +63,9 @@ praxis-test-utils = { workspace = true, optional = true }
 quote = { workspace = true, optional = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"], optional = true }
-serde = { workspace = true, optional = true }
+# Unconditional: `fips host-check` deserializes the compiled-in certified
+# modules list, and the FIPS xtask build runs without default features.
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

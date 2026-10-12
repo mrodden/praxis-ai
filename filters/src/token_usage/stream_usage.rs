@@ -38,7 +38,7 @@ mod tests;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::json_body::replace_json_body;
+use praxis_ai_apis::{json_body::replace_json_body, operation::normalize_path};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -60,9 +60,7 @@ use tracing::debug;
 /// operation-registry policy — query string ignored, one trailing slash
 /// tolerated — so `POST /v1/chat/completions/` cannot bypass injection.
 fn is_chat_completions(ctx: &HttpFilterContext<'_>) -> bool {
-    let path = ctx.request.uri.path();
-    let path = path.strip_suffix('/').filter(|path| !path.is_empty()).unwrap_or(path);
-    path.ends_with("/chat/completions")
+    normalize_path(ctx.request.uri.path()).ends_with("/chat/completions")
 }
 
 /// Returns `true` when the body is a streaming request without `include_usage`.

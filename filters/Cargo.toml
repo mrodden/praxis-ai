@@ -16,6 +16,9 @@ name = "praxis_ai_filters"
 default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
+# EnMaaS API-key authentication. Kept out of the lean standard graph because
+# its direct HTTP client is intentionally excluded from minimal builds.
+api-key-auth-filter = ["dep:reqwest"]
 # The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
 # can omit the policy engine and its pure-Rust cryptography.
 policy-engine = ["praxis-filter/policy-engine"]
@@ -31,6 +34,7 @@ openai-responses = ["praxis-ai-apis/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-apis/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-apis/store"]
 store-postgres = ["store", "praxis-ai-apis/store-postgres"]
+store-postgres-cert-auth = ["store", "praxis-ai-apis/store-postgres-cert-auth"]
 store-sqlite = ["store", "praxis-ai-apis/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-apis/openai-conversations"]
@@ -39,7 +43,7 @@ openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental filter; equals the pre-feature-split capability.
-full = ["standard", "openai-all", "store-postgres"]
+full = ["standard", "api-key-auth-filter", "openai-all", "store-postgres"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental", "dep:serde_json_path"]
@@ -56,11 +60,16 @@ gcp-adc-filter = ["experimental", "dep:jsonwebtoken"]
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
 # HA/clustered-Valkey failure modes, how this relates to Kuadrant's
-# TokenRateLimitPolicy) -- see ai#796. Activates the `experimental` marker.
+# TokenRateLimitPolicy) -- see ai#796. The bounded observability contract is
+# tracked by ai#883. Activates the `experimental` marker.
 # Also pulls in `redis` and `thiserror`, which only this filter uses --
 # optional so the rest of the crate (and its consumers) don't compile the
 # Valkey client and its transitive deps unless this feature is on.
 token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
+# Experimental pre-forward input/output token ceiling guard.  Kept separate
+# from token-rate-limit-filter because static request admission must fail
+# closed independently of quota-backend health.
+token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
@@ -90,14 +99,16 @@ praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
+reqwest = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
-reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 serde_json_path = { workspace = true, optional = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true, optional = true }
+tiktoken-rs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -108,10 +119,8 @@ zeroize = { workspace = true, features = ["serde"] }
 # The SigV4 reference implementation the OpenSSL-backed signer is checked
 # against (filters/src/aws/signing.rs); never linked into the binary.
 aws-sigv4 = { workspace = true }
-# Generate ephemeral RSA material for GCP key-file auth tests. No test
-# credential is checked into the repository.
-openssl.workspace = true
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }

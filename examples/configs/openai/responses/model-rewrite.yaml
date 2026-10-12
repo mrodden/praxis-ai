@@ -1,9 +1,10 @@
-# Responses Model Rewrite
+# Responses and Chat Completions Model Rewrite
 #
 # Rewrites or injects the top-level `model` field in Responses API
-# request bodies before forwarding to the inference backend.
+# and Chat Completions request bodies before forwarding to the
+# inference backend.
 #
-# This pipeline uses `openai_responses_format` to classify the
+# This pipeline uses `openai_responses_request` to classify the
 # request, then `openai_responses_model_rewrite` to apply alias
 # mapping. The router uses the effective model header to select
 # the backend cluster, so routing reflects the rewritten model,
@@ -11,7 +12,10 @@
 #
 # Use case: Codex or other Responses API clients send
 # `model: "codex-mini-2026-06-24"` and the proxy transparently
-# rewrites it to a locally-hosted model before forwarding.
+# rewrites it to a locally-hosted model before forwarding. The same
+# alias table covers `POST /v1/chat/completions`, so a gateway that
+# advertises one client-facing name can forward the provider-specific
+# target model on either API.
 #
 # Build:
 #   cargo build -p praxis-ai-proxy
@@ -24,7 +28,11 @@ listeners:
 filter_chains:
   - name: model-rewrite-pipeline
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -46,6 +54,14 @@ filter_chains:
               x-praxis-ai-effective-model: "llama-3.3-70b"
             cluster: "llama-backend"
           - path: "/v1/responses"
+            headers:
+              x-praxis-ai-effective-model: "qwen-2.5-72b"
+            cluster: "qwen-backend"
+          - path: "/v1/chat/completions"
+            headers:
+              x-praxis-ai-effective-model: "llama-3.3-70b"
+            cluster: "llama-backend"
+          - path: "/v1/chat/completions"
             headers:
               x-praxis-ai-effective-model: "qwen-2.5-72b"
             cluster: "qwen-backend"

@@ -18,8 +18,8 @@ use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
-    ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    arm_decision, canonicalize_logical_response, encode_local_completion, encode_local_error,
+    ArmDecision, CompletionState, StreamEventsFilter, StreamEventsState, accumulate_response_object, arm_decision,
+    canonicalize_logical_response, encode_local_completion, encode_local_error,
 };
 use crate::{
     openai::{
@@ -29,14 +29,58 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
-fn make_filter() -> OpenaiStreamEventsFilter {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    OpenaiStreamEventsFilter::build(&yaml).unwrap()
+#[test]
+fn done_after_terminal_at_max_events_is_allowed() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 1);
+
+    let mut done = Some(make_done_chunk());
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(state.event_count, 1, "[DONE] must not consume an event slot");
+    assert_eq!(state.completion_state, CompletionState::TerminalLifecycle);
+    assert!(state.deferred_done, "the downstream sentinel must be retained");
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    assert!(ctx.get_metadata("responses.stream_incomplete").is_none());
+    assert!(
+        eos.as_deref().is_some_and(|bytes| bytes.ends_with(b"data: [DONE]\n\n")),
+        "a valid terminal stream must forward its [DONE] sentinel"
+    );
 }
 
-fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
+#[test]
+fn counted_event_beyond_max_events_is_rejected() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let mut first = Some(make_sse_chunk("response.output_text.delta", &json!({"delta": "first"})));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut second = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"delta": "second"}),
+    ));
+    filter.on_response_body(&mut ctx, &mut second, false).unwrap();
+    assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+fn make_filter() -> StreamEventsFilter {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    StreamEventsFilter::build(&yaml).unwrap()
+}
+
+fn make_filter_from(yaml: &str) -> StreamEventsFilter {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-    OpenaiStreamEventsFilter::build(&yaml).unwrap()
+    StreamEventsFilter::build(&yaml).unwrap()
 }
 
 /// Build a context and arm the filter as the IRR runner plus `on_request`
@@ -49,15 +93,8 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
 /// (arm inside IRR, reject outside, ignore otherwise) is unit tested directly
 /// through `arm_decision`; the end-to-end arming effect with a real IRR-inserted
 /// `IterationState` is covered by the functional integration tests.
-fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
-    ctx.current_filter_id = Some(0);
-    filter.arm(&mut ctx);
-    (filter, ctx)
+fn make_armed_context() -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
+    make_armed_context_with_filter(make_filter())
 }
 
 #[test]
@@ -79,7 +116,7 @@ fn arm_decision_ignores_non_streaming_or_non_responses_requests() {
 #[test]
 fn default_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let filter = StreamEventsFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "openai_stream_events");
 }
 
@@ -87,7 +124,7 @@ fn default_config_parses() {
 fn custom_config_overrides_apply() {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("max_buffer_bytes: 1048576\nmax_events: 500\ntimeout_secs: 60").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml);
+    let filter = StreamEventsFilter::from_config(&yaml);
     assert!(filter.is_ok(), "custom config should parse");
 }
 
@@ -479,9 +516,9 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
         json!([{"type": "custom", "name": "run_python"}]),
         "tools restored to the client's custom declaration"
     );
-    assert!(
-        state.response_object.get("tool_choice").is_none(),
-        "a Null tool_choice echo removes the field"
+    assert_eq!(
+        state.response_object["tool_choice"], "auto",
+        "a Null tool_choice echo normalizes to auto"
     );
     assert!(
         !state.response_object.to_string().contains("agentic_ns__"),
@@ -541,49 +578,49 @@ fn response_body_access_is_always_read_write() {
 #[test]
 fn unknown_config_field_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("bogus_field: true").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "unknown fields should be rejected");
 }
 
 #[test]
 fn zero_max_buffer_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_buffer_bytes: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero max_buffer_bytes should be rejected");
 }
 
 #[test]
 fn zero_max_events_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_events: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero max_events should be rejected");
 }
 
 #[test]
 fn zero_timeout_secs_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero timeout_secs should be rejected");
 }
 
 #[test]
 fn zero_max_tool_call_argument_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero max_tool_call_argument_bytes should be rejected");
 }
 
 #[test]
 fn oversized_max_buffer_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_buffer_bytes: 100000000").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "max_buffer_bytes above 64 MiB should be rejected");
 }
 
 #[test]
 fn oversized_max_tool_call_argument_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 100000000").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(
         result.is_err(),
         "max_tool_call_argument_bytes above 64 MiB should be rejected"
@@ -593,35 +630,35 @@ fn oversized_max_tool_call_argument_bytes_rejected() {
 #[test]
 fn oversized_max_events_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_events: 100000000").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "max_events above the ceiling should be rejected");
 }
 
 #[test]
 fn zero_max_accumulated_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero max_accumulated_bytes should be rejected");
 }
 
 #[test]
 fn oversized_max_accumulated_bytes_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 100000000").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "max_accumulated_bytes above 64 MiB should be rejected");
 }
 
 #[test]
 fn zero_max_output_items_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 0").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero max_output_items should be rejected");
 }
 
 #[test]
 fn oversized_max_output_items_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 100000000").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "max_output_items above the ceiling should be rejected");
 }
 
@@ -629,7 +666,7 @@ fn oversized_max_output_items_rejected() {
 fn accumulation_budget_fields_accepted() {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("max_accumulated_bytes: 1048576\nmax_output_items: 500").unwrap();
-    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    let result = StreamEventsFilter::from_config(&yaml);
     assert!(result.is_ok(), "in-range accumulation budget fields should be accepted");
 }
 
@@ -641,8 +678,8 @@ async fn on_request_rejects_streaming_responses_outside_irr() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -698,8 +735,8 @@ async fn does_not_arm_for_non_streaming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -714,8 +751,8 @@ async fn does_not_arm_for_non_responses_format() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_chat_completions".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -734,8 +771,8 @@ async fn does_not_arm_for_other_responses_routes() {
         let filter = make_filter();
         let req = make_request(method, path);
         let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-        ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+        ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+        ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
         ctx.current_filter_id = Some(0);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1022,7 +1059,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
     ));
     filter.on_response_body(&mut ctx, &mut model_item, false).unwrap();
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -1040,7 +1077,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
         json!({"type": "web_search_call", "id": "ws_local_2", "status": "completed"}),
     ];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let mut resumed_created = Some(make_sse_chunk(
@@ -1186,9 +1223,27 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
     );
 }
 
+#[tokio::test]
+async fn logical_stream_rejects_event_type_line_injection() {
+    for delimiter in ["\r", "\n", "\r\n"] {
+        let filter = make_filter();
+        let mut ctx = arm_plain_stream(&filter);
+        let payload = json!({"type": format!("future{delimiter}data: {{}}{delimiter}{delimiter}event: injected")});
+        let mut chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_none(), "unsafe event must not be forwarded");
+        let mut eos = None;
+        filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+        let output = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+        assert!(output.contains("event: error"));
+        assert!(!output.contains("injected"));
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
 /// Arm a plain streaming logical-stream context (no hosted tools) for the given
 /// filter, then feed a `response.created` opener. Returns the armed context.
-fn arm_plain_stream(filter: &OpenaiStreamEventsFilter) -> praxis_filter::HttpFilterContext<'static> {
+fn arm_plain_stream(filter: &StreamEventsFilter) -> praxis_filter::HttpFilterContext<'static> {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1819,7 +1874,7 @@ async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
-/// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search`)
+/// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search_dispatch`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`
 /// with genuinely executed items call this so synthesis is not suppressed by the
 /// provenance gate; the fabricated-lifecycle regression test deliberately does
@@ -1840,7 +1895,7 @@ fn mark_accumulated_output_executed(state: &mut ResponsesState) {
 async fn arm_resumed_round_with_accumulated(
     loop_filter: &'static str,
     accumulated: Vec<serde_json::Value>,
-) -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
+) -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
@@ -2458,7 +2513,7 @@ async fn logical_stream_synthesizes_progress_for_model_declared_item_without_rep
     ));
     filter.on_response_body(&mut ctx, &mut model_item, false).unwrap();
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2470,7 +2525,7 @@ async fn logical_stream_synthesizes_progress_for_model_declared_item_without_rep
     state.iteration = 1;
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -2556,7 +2611,7 @@ async fn logical_stream_synthesizes_progress_when_model_streams_added_then_done_
         "the premature round-0 output_item.done for a locally executed tool must be suppressed"
     );
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2569,7 +2624,7 @@ async fn logical_stream_synthesizes_progress_when_model_streams_added_then_done_
     state.iteration = 1;
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -2674,7 +2729,7 @@ async fn logical_stream_does_not_resynthesize_progress_streamed_in_band_by_model
     ));
     filter.on_response_body(&mut ctx, &mut model_done, false).unwrap();
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2686,7 +2741,7 @@ async fn logical_stream_does_not_resynthesize_progress_streamed_in_band_by_model
     state.iteration = 1;
     state.accumulated_output = vec![hosted_item];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -2773,7 +2828,7 @@ async fn logical_stream_synthesizes_missing_phases_after_partial_in_band_lifecyc
         "a done that finalizes a still-partial local-tool lifecycle must be suppressed"
     );
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2786,7 +2841,7 @@ async fn logical_stream_synthesizes_missing_phases_after_partial_in_band_lifecyc
     state.iteration = 1;
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -2872,7 +2927,7 @@ async fn logical_stream_fills_middle_phase_after_leading_in_band_progress() {
         "the model's in-band in_progress event must pass through to the client"
     );
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2884,7 +2939,7 @@ async fn logical_stream_fills_middle_phase_after_leading_in_band_progress() {
     state.iteration = 1;
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -2986,7 +3041,7 @@ async fn logical_stream_keeps_in_band_done_when_outcome_streams_without_searchin
     );
 
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -2998,7 +3053,7 @@ async fn logical_stream_keeps_in_band_done_when_outcome_streams_without_searchin
     state.iteration = 1;
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -3069,7 +3124,7 @@ async fn logical_stream_honors_skipped_leading_phase_when_only_searching_streame
     assert!(searching.is_some(), "the in-band searching event must pass through");
 
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -3081,7 +3136,7 @@ async fn logical_stream_honors_skipped_leading_phase_when_only_searching_streame
     state.iteration = 1;
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -3125,7 +3180,7 @@ async fn logical_stream_reemits_outcome_when_local_item_gains_sources() {
     // payload — the terminal phase event is payloadless, so re-emitting it would
     // be a pure duplicate that conveys nothing about the change.
     let (filter, mut ctx) = arm_resumed_round_with_accumulated(
-        "openai_web_search",
+        "openai_web_search_dispatch",
         vec![json!({
             "type": "web_search_call",
             "id": "ws_sources_1",
@@ -3324,7 +3379,7 @@ async fn logical_stream_finalizes_local_item_when_done_envelope_missing_and_cont
 
     // The round ends (IRR loop) before the backend sends `output_item.done`.
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -3336,7 +3391,7 @@ async fn logical_stream_finalizes_local_item_when_done_envelope_missing_and_cont
     state.iteration = 1;
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -3416,7 +3471,7 @@ async fn logical_stream_finalizes_without_duplicating_terminal_phase_when_conten
 
     // The round ends (IRR loop) before the backend sends `output_item.done`.
     ctx.filter_results
-        .entry("openai_web_search")
+        .entry("openai_web_search_dispatch")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -3433,7 +3488,7 @@ async fn logical_stream_finalizes_without_duplicating_terminal_phase_when_conten
         "action": {"type": "search", "query": "rust", "sources": [{"type": "url", "url": "https://a"}]}
     })];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_web_search");
+    ctx.filter_results.remove("openai_web_search_dispatch");
     filter.arm(&mut ctx);
 
     let delta = resumed_text_delta(&filter, &mut ctx);
@@ -4726,11 +4781,11 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_enforced() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -4771,11 +4826,11 @@ async fn tool_call_argument_bytes_cap_enforced() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -4817,11 +4872,11 @@ async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -4867,11 +4922,11 @@ async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
 #[tokio::test]
 async fn tool_call_argument_bytes_within_limit() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 50").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -4983,8 +5038,8 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -5082,11 +5137,11 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
     use praxis_core::connectivity::{ConnectionOptions, Upstream};
 
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -5106,7 +5161,7 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
 #[tokio::test]
 async fn apply_arm_does_not_cap_before_load_balancing() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.current_filter_id = Some(0);
@@ -5115,7 +5170,7 @@ async fn apply_arm_does_not_cap_before_load_balancing() {
     filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
 
     assert!(
-        OpenaiStreamEventsFilter::is_armed(&ctx),
+        StreamEventsFilter::is_armed(&ctx),
         "arming must still install parser state when ctx.upstream is unset"
     );
     assert!(
@@ -5131,7 +5186,7 @@ async fn apply_arm_keeps_a_tighter_cluster_read_timeout() {
     use praxis_core::connectivity::{ConnectionOptions, Upstream};
 
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 300").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.current_filter_id = Some(0);
@@ -5193,10 +5248,12 @@ fn first_chunk_recaps_absolute_deadline_onto_live_body() {
     let state = ctx
         .get_filter_state::<StreamEventsState>()
         .expect("parser state must remain installed");
+    let started = state.started_at.expect("first chunk must start the deadline");
+    let expected = started + state.timeout;
     let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("the first chunk must publish a read timeout cap");
-    assert!(applied > Duration::from_secs(299) && applied <= state.timeout);
+        .stream_deadline_cap()
+        .expect("the first chunk must publish an absolute deadline");
+    assert_eq!(applied, expected);
     assert!(
         state.timeout <= Duration::from_secs(300),
         "unexpected test timeout budget: {:?}",
@@ -5218,18 +5275,15 @@ fn stream_deadline_cap_shrinks_after_first_chunk() {
     let adjusted_started = std::time::Instant::now() - Duration::from_millis(750);
     state.started_at = Some(adjusted_started);
     let expected = adjusted_started + state.timeout;
-    let now = std::time::Instant::now();
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "again"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("each chunk must republish a read timeout cap");
-    assert!(
-        applied <= expected.saturating_duration_since(now),
-        "each chunk must republish the remaining absolute budget, not a fresh relative timer at now={now:?}"
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
+        "each chunk must republish the same absolute cutoff, not a fresh relative timer"
     );
 }
 
@@ -5248,8 +5302,9 @@ fn stream_deadline_caps_live_body_after_first_chunk() {
     ctx.insert_filter_state(state);
     super::recap_stream_deadline(&mut ctx, expected);
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published on the live body"
     );
 }
@@ -5261,11 +5316,11 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     use praxis_core::connectivity::{ConnectionOptions, Upstream};
 
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
-    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -5288,13 +5343,15 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let started = state.started_at.expect("first chunk must start the deadline");
     state.timeout = Duration::from_secs(1);
     state.started_at = Some(started.checked_sub(Duration::from_millis(750)).unwrap_or(started));
+    let expected = state.started_at.unwrap() + state.timeout;
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published for the live body even when ctx.upstream is None"
     );
 }
@@ -5429,7 +5486,7 @@ fn responses_event(event_type: &str, mut payload: serde_json::Value) -> crate::o
     ResponsesEvent::from_frame(&frame).unwrap()
 }
 
-impl OpenaiStreamEventsFilter {
+impl StreamEventsFilter {
     fn test_filter() -> Self {
         Self {
             parser_config: crate::openai::sse::SseParserConfig {
@@ -5451,7 +5508,7 @@ fn suppress_mode_drops_private_function_call_lifecycle() {
     // A private function_call(name=file_search) opened while a hosted file_search
     // tool is declared: its added/delta/done all suppressed (nothing emitted).
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
 
@@ -5488,7 +5545,7 @@ fn client_function_call_without_hosted_tool_passes_through() {
 
     // has_file_search_tool == false: not suppressed, reaches the wire (P1 round-11).
     let mut ctx = test_ctx_without_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -5512,7 +5569,7 @@ fn native_hybrid_drops_pending_done_and_passes_opening() {
     use super::{StreamEventsState, append_logical_event};
 
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -5543,7 +5600,7 @@ fn native_terminal_done_passes_and_cancels_synthesis() {
     use super::{StreamEventsState, append_logical_event};
 
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -5582,7 +5639,7 @@ fn native_failed_done_records_observation_for_reconcile_skip() {
     // and must be recorded — the reconcile skips by observed membership, not status, so a
     // synthesized tail cannot duplicate this live terminal done.
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -5776,7 +5833,7 @@ fn drain_invalid_index_sets_error_and_no_gap() {
 // §10 P0: native-progress-precedes-closed-error ordering (no gap, no rewind).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_progress_precedes_closed_error_ordering() {
-    let filter = OpenaiStreamEventsFilter::test_filter();
+    let filter = StreamEventsFilter::test_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -5814,7 +5871,7 @@ async fn native_progress_precedes_closed_error_ordering() {
 
     // Set up closed-failure state: file_search publishes action=done + logical_stream_error
     ctx.filter_results
-        .entry("openai_file_search_callout")
+        .entry("openai_file_search_dispatch")
         .or_default()
         .set("action", "done")
         .unwrap();
@@ -6616,4 +6673,47 @@ async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
         eos_out.contains("event: error"),
         "the logical stream must terminate with an error event: {eos_out}"
     );
+}
+
+#[test]
+fn logical_stream_preserves_reasoning_wire_discriminators() {
+    for event_type in [
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.reasoning.delta",
+        "response.reasoning.done",
+    ] {
+        let (filter, mut ctx) = make_armed_context();
+        let mut body = Some(make_sse_chunk(
+            event_type,
+            &json!({
+                "item_id":"rs_test", "output_index":0, "content_index":0,
+                "delta":"thought", "text":"thought", "sequence_number":0,
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        let bytes = body.unwrap();
+        let wire = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            wire.starts_with(&format!("event: {event_type}\n")),
+            "wire alias must survive logical composition: {wire}"
+        );
+        let data = wire.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(payload["type"], event_type);
+    }
+}
+
+// Test Utilities
+
+fn make_armed_context_with_filter(
+    filter: StreamEventsFilter,
+) -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    filter.arm(&mut ctx);
+    (filter, ctx)
 }

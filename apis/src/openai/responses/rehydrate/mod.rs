@@ -34,23 +34,27 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use praxis_filter::{
-    EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, canonical_openresponses_replay_item,
-    error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
+    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
+    error::responses_error_rejection,
+    extract_conversation_id,
+    history::MessageHistory,
+    state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+    store::{ResponseRecord, ResponseStoreRegistry},
 };
 
 // -----------------------------------------------------------------------------
@@ -83,7 +87,17 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// ```yaml
 /// filter: openai_responses_rehydrate
 /// ```
+#[derive(Default)]
 pub struct RehydrateFilter;
+
+/// Configuration for `openai_responses_rehydrate`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty mapping accepts omitted config while deny_unknown_fields rejects stale options"
+)]
+struct RehydrateConfig {}
 
 impl RehydrateFilter {
     /// Create a filter from YAML config.
@@ -93,10 +107,7 @@ impl RehydrateFilter {
     /// Returns [`FilterError`] if the YAML config contains unknown
     /// fields.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        // The filter has no tunable options. Parsing still runs so that
-        // `deny_unknown_fields` rejects any config keys, including the removed
-        // `max_history_bytes` / `max_history_items` limits.
-        let _: EmptyFilterConfig = parse_filter_config("openai_responses_rehydrate", config)?;
+        let _: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", config)?;
         Ok(Box::new(Self))
     }
 
@@ -104,7 +115,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// The upstream `openai_responses_request` filter rejects requests that
     /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
@@ -165,11 +176,10 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
-            Ok(r) => r,
+        let stored = match fetch_conversation(ctx, &owner, &conv_id).await {
+            Ok(history) => history,
             Err(action) => return Ok(action),
         };
-        let stored = stored_messages_for_conversation(record);
         let state = build_state(parsed_body, stored, vec![], None);
         install_rehydrated_state(ctx, state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
@@ -184,6 +194,10 @@ impl HttpFilter for RehydrateFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
 
@@ -230,11 +244,20 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
             return Ok(FilterAction::Release);
         }
 
         self.rehydrate(ctx, body).await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -1117,14 +1140,6 @@ fn stored_messages_for_response(mut record: ResponseRecord) -> Vec<Value> {
     }
 }
 
-/// Stored messages from a conversation record.
-fn stored_messages_for_conversation(record: ConversationRecord) -> Vec<Value> {
-    match record.messages {
-        Value::Array(arr) => arr,
-        _ => vec![],
-    }
-}
-
 /// Fetch the previous response and validate its status in one step.
 async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
@@ -1140,7 +1155,12 @@ async fn fetch_and_validate_previous(
 /// `Release` when no conversation field is present or a `Reject`
 /// when the field is malformed.
 fn resolve_conversation_id(body: &Value) -> Result<String, FilterAction> {
-    let has_field = body.get("conversation").is_some();
+    // An explicit null selects no conversation, the same as omitting the field.
+    // Treating it as present rejects a well-formed body — a token-count request
+    // carrying `"conversation": null` would be told its conversation value is
+    // malformed. The classifier and the request processor already read both
+    // history selectors this way.
+    let has_field = body.get("conversation").is_some_and(|value| !value.is_null());
     extract_conversation_id(body).ok_or_else(|| {
         if has_field {
             FilterAction::Reject(responses_error_rejection(
@@ -1159,7 +1179,7 @@ async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     conv_id: &str,
-) -> Result<ConversationRecord, FilterAction> {
+) -> Result<Vec<Value>, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
         reject_server_error("response store is not available")
@@ -1170,7 +1190,7 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(conv_id).await.map_err(|e| {
+    let record = store.conversation_history(conv_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch conversation");
         reject_server_error("failed to fetch conversation")
     })?;
@@ -1188,11 +1208,15 @@ fn build_state(
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
 ) -> ResponsesState {
+    let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
-    state.messages.splice(0..0, replay);
-    state.persisted_messages.splice(0..0, stored);
+    state.messages.prepend_shared(replay);
+    state
+        .provider_compaction_ids
+        .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
+    state.persisted_messages.prepend_shared(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
@@ -1226,8 +1250,31 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 }
 
 /// Return stored items that should be replayed as backend request input.
-fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
-    stored.iter().filter_map(canonical_openresponses_replay_item).collect()
+fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
+    let mut replay = MessageHistory::default();
+    for item in stored.shared_items() {
+        let is_locally_marked = item.get(LOCAL_COMPACTION_MARKER).and_then(Value::as_bool) == Some(true);
+        if !is_locally_marked
+            && matches!(
+                item.get("type").and_then(Value::as_str),
+                Some(
+                    "item_reference"
+                        | "reasoning"
+                        | "compaction"
+                        | "message"
+                        | "function_call"
+                        | "function_call_output"
+                )
+            )
+        {
+            replay.push_shared(std::sync::Arc::clone(item));
+        } else if let Some(normalized) = canonical_openresponses_replay_item(item) {
+            // Legacy normalization and marker removal change the replay value,
+            // not the exact persisted item. Only that item needs an owned copy.
+            replay.push(strip_local_compaction_marker(normalized));
+        }
+    }
+    replay
 }
 
 /// Parse the request body and extract `previous_response_id`.
@@ -1332,14 +1379,16 @@ fn bind_previous_tools_to_owner(listings: &mut [Value], owner: &StateOwner) {
     }
 }
 
+/// Deduplicate only listings for the same target and tool-name set.
+type McpListingKey = (String, Option<String>, Vec<String>);
+
 /// Append MCP tool listings from a sequence of response items.
-fn collect_mcp_tool_listings_from_items(
-    items: &[Value],
-    seen: &mut HashSet<(String, Vec<String>)>,
-    listings: &mut Vec<Value>,
-) {
+fn collect_mcp_tool_listings_from_items(items: &[Value], seen: &mut HashSet<McpListingKey>, listings: &mut Vec<Value>) {
     listings.extend(items.iter().filter_map(|item| {
-        if item.get("type").and_then(Value::as_str) != Some("mcp_list_tools") {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("mcp_list_tools" | "praxis_mcp_cached_listing")
+        ) {
             return None;
         }
 
@@ -1349,14 +1398,15 @@ fn collect_mcp_tool_listings_from_items(
         names.sort();
         names.dedup();
 
-        if !seen.insert((label.to_owned(), names)) {
+        let url = item.get("server_url").and_then(Value::as_str);
+        if !seen.insert((label.to_owned(), url.map(str::to_owned), names)) {
             return None;
         }
 
         let mut map = serde_json::Map::new();
         map.insert("server_label".to_owned(), Value::String(label.to_owned()));
         map.insert("tools".to_owned(), Value::Array(tools.clone()));
-        if let Some(url) = item.get("server_url").and_then(Value::as_str) {
+        if let Some(url) = url {
             map.insert("server_url".to_owned(), Value::String(url.to_owned()));
         }
         Some(Value::Object(map))
@@ -1377,7 +1427,7 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// [`build_state`] reconstructs [`ResponsesState`] from the request body, so
 /// markers not derivable from the body alone must be carried across the
 /// replacement. Currently that is the store filter's
-/// [`ResponsesState::store_persist_armed`] flag, which `openai_response_store`
+/// [`ResponsesState::store_persist_armed`] flag, which `openai_responses_store`
 /// sets before rehydrate runs. Dropping it here would make `mcp_dispatch`
 /// falsely reject a continuation-turn `mcp_approval_request` as unresumable,
 /// even though the store is configured and will persist the response.

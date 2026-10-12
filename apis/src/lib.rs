@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;
@@ -24,8 +25,11 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
+pub mod operation_classifier;
 mod project_state_owner_headers;
 pub mod promotion;
+#[cfg(feature = "store")]
+pub(crate) mod service;
 mod state_owner;
 #[cfg(feature = "store")]
 pub mod store;
@@ -43,8 +47,9 @@ pub const MODEL_PROVIDER_HEADER: &str = "x-praxis-ai-provider";
 pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
-pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
+pub use state_owner::{StateOwnerFilter, project_state_owner};
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -122,6 +127,7 @@ pub(crate) mod test_utils {
             downstream_tls: false,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
+            executed_branch_filters: Vec::new(),
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
@@ -171,7 +177,14 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(feature = "store")]
+    #[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
+    #[cfg_attr(
+        not(feature = "store-sqlite"),
+        allow(
+            dead_code,
+            reason = "store test helpers run against the sqlite in-process backend; a postgres-only build compiles this unused"
+        )
+    )]
     pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
         crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
             .expect("test owner should be valid")
@@ -202,11 +215,15 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
+            http "ai_operation" => crate::operation_classifier::AiOperationFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_response_store" => crate::openai::ResponseStoreFilter::from_config
+            http "openai_responses_request" => crate::openai::OpenaiResponsesRequestFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_responses_store" => crate::openai::ResponseStoreFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
@@ -214,7 +231,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_stream_events" => crate::openai::OpenaiStreamEventsFilter::from_config
+            http "openai_stream_events" => crate::openai::StreamEventsFilter::from_config
         );
         registry
     }

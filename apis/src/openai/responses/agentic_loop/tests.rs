@@ -5,16 +5,181 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
+#[cfg(feature = "openai-mcp-tools")]
+use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{
-        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
-    },
+    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
     test_utils::{make_filter_context, make_request},
 };
+// `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
+// the collector-to-storage reconciliation tests below compile only with it.
+#[cfg(feature = "store")]
+use crate::{
+    service::responses::{StoredOutputPlan, build_record},
+    state_owner::StateOwner,
+};
+
+/// Exercise both collectors with real provenance, then pass that state through
+/// storage assembly.
+#[cfg(feature = "store")]
+fn assert_collected_rounds_reconcile(streaming: bool) {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
+    let first = json!({"output": [
+        {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "first"}]},
+        {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+        {"type": "message", "id": "msg_1", "role": "assistant", "content": "searching"}
+    ]});
+    if streaming {
+        state.response_object = first;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&first, &mut state, &[]);
+    }
+    assert_eq!(state.collected_rounds[0].output_start, 0);
+    assert_eq!(state.collected_rounds[0].output_end, 3);
+    assert_eq!(state.collected_rounds[0].persisted_start, 1);
+    assert_eq!(state.collected_rounds[0].persisted_end, 3);
+    assert_eq!(state.collected_output_provenance, [(0, 1), (1, 2)]);
+
+    // Dispatch appends a result between rounds. It must remain after msg_1.
+    state.persisted_messages.push(json!({
+        "type": "function_call_output", "call_id": "call_1", "output": "result"
+    }));
+    let second = json!({"output": [
+        {"type": "message", "id": "msg_2", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "id": "rs_2", "content": [{"type": "reasoning_text", "text": "late"}]}
+    ]});
+    if streaming {
+        state.response_object = second;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&second, &mut state, &[]);
+    }
+    assert_eq!(state.collected_rounds[1].output_start, 3);
+    assert_eq!(state.collected_rounds[1].output_end, 5);
+    assert_eq!(state.collected_rounds[1].persisted_start, 4);
+    assert_eq!(state.collected_rounds[1].persisted_end, 5);
+    assert_eq!(state.collected_output_provenance, [(0, 1), (1, 2), (4, 4)]);
+
+    state.translated_reasoning_replay.push(3..=4);
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let response = json!({
+        "id": "resp_collected", "created_at": 1, "model": "m",
+        "output": state.accumulated_output
+    });
+    let record = build_record(
+        response,
+        owner,
+        Some(json!([{"role": "user", "content": "question"}])),
+        Some(state.persisted_messages.into_values()),
+        StoredOutputPlan {
+            reasoning_replay: &state.translated_reasoning_replay,
+            collected_rounds: &state.collected_rounds,
+            collected_provenance: &state.collected_output_provenance,
+        },
+    )
+    .unwrap();
+    let types: Vec<_> = record
+        .messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "message",
+            "reasoning",
+            "web_search_call",
+            "message",
+            "function_call_output",
+            "reasoning",
+            "message"
+        ]
+    );
+    assert_eq!(record.messages[5]["content"][0]["text"], "late");
+}
+
+#[cfg(feature = "store")]
+#[test]
+fn buffered_collector_provenance_reconciles_stored_rounds() {
+    assert_collected_rounds_reconcile(false);
+}
+
+#[cfg(feature = "store")]
+#[test]
+fn streaming_collector_provenance_reconciles_stored_rounds() {
+    assert_collected_rounds_reconcile(true);
+}
+
+/// A provider compaction item enters both `accumulated_output` and
+/// `persisted_messages`. The collector must record its provenance so storage
+/// assembly refreshes it in place rather than appending a second copy.
+#[cfg(feature = "store")]
+fn assert_collected_compaction_stored_once(streaming: bool) {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
+    let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "provider-state"});
+    let response = json!({"output": [
+        compaction.clone(),
+        {"type": "message", "id": "msg_1", "role": "assistant", "content": "answer"}
+    ]});
+    if streaming {
+        state.response_object = response;
+        super::collect_streaming_output_items(&mut state);
+    } else {
+        super::collect_output_items(&response, &mut state, &[]);
+    }
+    assert!(
+        state
+            .collected_output_provenance
+            .iter()
+            .any(|&(output_index, _)| output_index == 0),
+        "the compaction output item must be recorded as collected"
+    );
+
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let response = json!({
+        "id": "resp_compaction", "created_at": 1, "model": "m",
+        "output": state.accumulated_output
+    });
+    let record = build_record(
+        response,
+        owner,
+        Some(json!([{"role": "user", "content": "question"}])),
+        Some(state.persisted_messages.into_values()),
+        StoredOutputPlan {
+            reasoning_replay: &[],
+            collected_rounds: &state.collected_rounds,
+            collected_provenance: &state.collected_output_provenance,
+        },
+    )
+    .unwrap();
+    let compactions = record
+        .messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .count();
+    assert_eq!(compactions, 1, "the provider compaction must be stored exactly once");
+}
+
+#[cfg(feature = "store")]
+#[test]
+fn buffered_collector_stores_compaction_once() {
+    assert_collected_compaction_stored_once(false);
+}
+
+#[cfg(feature = "store")]
+#[test]
+fn streaming_collector_stores_compaction_once() {
+    assert_collected_compaction_stored_once(true);
+}
 
 // -----------------------------------------------------------------------------
 // Config Parsing
@@ -293,6 +458,43 @@ async fn on_request_allows_buffered_mode_without_logical_stream() {
     );
 }
 
+#[tokio::test]
+async fn selected_adapter_enforces_deferred_streaming_guard() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    let rejection =
+        super::enforce_agentic_stream_guard(&mut ctx).expect("the selected adapter must reject unsafe typed streaming");
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn selected_adapter_accepts_deferred_streaming_with_logical_stream() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.logical_stream", "true");
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    assert!(
+        super::enforce_agentic_stream_guard(&mut ctx).is_none(),
+        "an armed logical stream should satisfy the deferred guard"
+    );
+    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body Bookkeeping
 // -----------------------------------------------------------------------------
@@ -394,6 +596,82 @@ async fn sets_content_type_on_reentry() {
         .iter()
         .any(|(k, v)| k == http::header::CONTENT_TYPE && v == "application/json");
     assert!(has_content_type, "IRR re-entry must set content-type: application/json");
+}
+
+#[test]
+fn continuation_headers_keep_order_in_the_legacy_queue() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    super::queue_continuation_header(&mut ctx, http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    super::queue_continuation_header(
+        &mut ctx,
+        http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    assert_eq!(
+        ctx.request_headers_to_set,
+        vec![
+            (http::header::AUTHORIZATION, "Bearer token".parse().unwrap()),
+            (http::header::CONTENT_TYPE, "application/json".parse().unwrap()),
+        ],
+        "continuation headers must queue into the legacy list in call order"
+    );
+    assert!(
+        ctx.pre_read_mutations.is_empty(),
+        "an empty ordered log must stay empty when no pre-read mutations exist"
+    );
+}
+
+#[test]
+fn continuation_headers_join_an_active_ordered_log() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        http::header::ACCEPT,
+        "application/json".parse().unwrap(),
+    ));
+    super::queue_continuation_header(&mut ctx, http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
+    super::queue_continuation_header(
+        &mut ctx,
+        http::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        2,
+        "both continuation headers must reach the legacy queue"
+    );
+    assert_eq!(
+        ctx.pre_read_mutations.len(),
+        3,
+        "both continuation headers must also join the pre-existing ordered log"
+    );
+    for ((name, value), mutation) in ctx
+        .request_headers_to_set
+        .iter()
+        .zip(ctx.pre_read_mutations.iter().skip(1))
+    {
+        let TrustedHeaderMutation::Set(ordered_name, ordered_value) = mutation else {
+            panic!("continuation header must be an ordered Set");
+        };
+        assert_eq!(
+            (name, value),
+            (ordered_name, ordered_value),
+            "legacy queue and ordered log must carry identical continuation headers in the same order"
+        );
+    }
+    assert_eq!(
+        ctx.request_headers_to_set[0].0,
+        http::header::AUTHORIZATION,
+        "the first queued continuation header must be authorization"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[1].0,
+        http::header::CONTENT_TYPE,
+        "the second queued continuation header must be content-type"
+    );
 }
 
 #[tokio::test]
@@ -692,7 +970,7 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
     assert_eq!(
         ctx.extensions.get::<ResponsesState>().unwrap().web_search_calls.len(),
         1,
-        "streamed web-search calls must be visible to openai_web_search"
+        "streamed web-search calls must be visible to openai_web_search_dispatch"
     );
     assert!(
         !ctx.extensions
@@ -741,6 +1019,7 @@ fn multiple_streamed_client_function_calls_end_done() {
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
     let filter = make_filter();
@@ -996,6 +1275,7 @@ fn non_end_of_stream_passes_through() {
 // on_response_body: Tool Calls Present → Loop
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn tool_calls_set_loop() {
     let filter = make_filter();
@@ -1013,6 +1293,7 @@ fn tool_calls_set_loop() {
     assert_eq!(state.iteration, 1, "iteration should be incremented");
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn any_dispatchable_call_type_sets_loop() {
     // An MCP `function_call`, a hosted `web_search_call`, and a hosted
@@ -1071,6 +1352,7 @@ fn completed_file_search_call_sets_done() {
 // on_response_body: Config Defaults
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn default_config_has_max_infer_iters_ten() {
     let filter = make_filter();
@@ -1100,6 +1382,7 @@ fn default_config_has_max_infer_iters_ten() {
 // on_response_body: Iteration Limit
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn max_infer_iters_one_allows_exactly_one_loop() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
@@ -1126,6 +1409,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn iteration_limit_returns_508_error() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 2").unwrap();
@@ -1197,6 +1481,7 @@ fn multiple_client_function_calls_are_preserved() {
     assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 2);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_buffered_function_call_ownership_returns_upstream_error() {
     let filter = make_filter();
@@ -1231,6 +1516,7 @@ fn mixed_buffered_function_call_ownership_returns_upstream_error() {
     assert!(ctx.extensions.get::<ResponsesState>().is_some());
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_buffered_custom_and_mcp_calls_return_upstream_error() {
     let filter = make_filter();
@@ -1261,6 +1547,7 @@ fn mixed_buffered_custom_and_mcp_calls_return_upstream_error() {
     assert_eq!(rejection.status, 502);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
     for client_call in [
@@ -1521,6 +1808,7 @@ fn finish_reason_length_passes_body_unchanged() {
 // on_response_body: Iteration Counter
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn iteration_incremented_on_loop() {
     let filter = make_filter();
@@ -1643,6 +1931,35 @@ fn appends_function_calls_to_messages() {
 }
 
 #[test]
+fn appends_provider_compaction_to_replay_state() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    ctx.extensions.insert(make_state_with_tool_calls(vec![]));
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-state"
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages[1]["type"], "compaction");
+    assert_eq!(state.persisted_messages[1]["id"], "cmp_provider");
+    assert!(
+        state.provider_compaction_ids.contains("cmp_provider"),
+        "provider compaction IDs must include replayable response output"
+    );
+}
+
+#[test]
 fn skips_extraction_when_body_is_none() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -1750,6 +2067,7 @@ fn parse_failure_clears_stale_state() {
 // on_response_body: Usage Accumulation
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn accumulates_usage_across_rounds() {
     let filter = make_filter();
@@ -2134,6 +2452,7 @@ fn web_search_call_excluded_from_messages_but_persisted() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn tool_search_call_queued_for_deferred_discovery() {
     let filter = make_filter();
@@ -2329,6 +2648,7 @@ fn incomplete_tool_search_call_is_not_queued_for_deferred_discovery() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
     let filter = make_filter();
@@ -2649,6 +2969,7 @@ fn malformed_function_call_status_is_ignored() {
 /// is parsed by the sole owner so that `accumulated_output` preserves the model's
 /// ordering while each dispatcher's target is recorded against the correct
 /// absolute index. Proves model output ordering survives all three dispatchers.
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn model_output_ordering_survives_all_three_dispatchers() {
     let filter = make_filter();
@@ -2731,10 +3052,39 @@ fn model_output_ordering_survives_all_three_dispatchers() {
 }
 
 #[test]
+fn buffered_and_streamed_history_share_payloads_and_detach_on_mutation() {
+    for streaming in [false, true] {
+        let response = json!({"output": [
+            {"type": "function_call", "id": "fc_shared", "call_id": "call_shared",
+             "name": "lookup", "arguments": "{}", "status": "completed"},
+            {"type": "reasoning", "id": "rs_shared", "summary": []}
+        ]});
+        let mut state = ResponsesState::default();
+        if streaming {
+            state.response_object = response;
+            super::collect_streaming_output_items(&mut state);
+        } else {
+            super::collect_output_items(&response, &mut state, &[]);
+        }
+        assert_eq!(state.messages.len(), 2, "both replay items collected");
+        assert_eq!(state.persisted_messages.len(), 2, "both persisted items collected");
+        for index in 0..2 {
+            assert!(
+                state.messages.shares_item_with(index, &state.persisted_messages, index),
+                "replay and persistence must share payloads (streaming={streaming})"
+            );
+        }
+        state.messages[0]["arguments"] = json!("changed");
+        assert_eq!(state.persisted_messages[0]["arguments"], "{}");
+        assert!(state.messages.shares_item_with(1, &state.persisted_messages, 1));
+    }
+}
+
+#[test]
 fn streamed_provider_conversation_marks_persisted_history() {
     let mut state = ResponsesState {
         conversation: Some(json!({"id": "conv_native"})),
-        messages: vec![json!({"role": "user", "content": "weather in SF"})],
+        messages: vec![json!({"role": "user", "content": "weather in SF"})].into(),
         response_object: json!({
             "output": [{
                 "type": "function_call",
@@ -2759,6 +3109,32 @@ fn streamed_provider_conversation_marks_persisted_history() {
         state.provider_history_len, 2,
         "prompt and function call should be persisted"
     );
+}
+
+#[test]
+fn appends_streamed_provider_compaction_to_replay_state() {
+    let compaction = json!({
+        "type": "compaction",
+        "id": "cmp_streamed",
+        "encrypted_content": "provider-state"
+    });
+    let input = json!({"type": "message", "role": "user", "content": "continue"});
+    let mut state = ResponsesState {
+        messages: vec![input.clone()].into(),
+        persisted_messages: vec![input].into(),
+        response_object: json!({"output": [compaction]}),
+        ..ResponsesState::default()
+    };
+
+    super::collect_streaming_output_items(&mut state);
+
+    assert_eq!(state.messages[1]["type"], "compaction");
+    assert_eq!(state.persisted_messages[1]["id"], "cmp_streamed");
+    assert!(
+        state.provider_compaction_ids.contains("cmp_streamed"),
+        "streamed provider compaction IDs must be retained for replay"
+    );
+    assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
 }
 
 /// Regression (#955): the sole owner stamps a stable synthetic id on every
@@ -2981,6 +3357,7 @@ fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     state
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 fn pending_deferred_connector() -> DeferredMcpConnector {
     DeferredMcpConnector {
         authorization: None,
@@ -2999,6 +3376,12 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
 /// A completed `function_call` whose encoded name (`server__lookup`) resolves to
 /// the MCP tool registered by [`make_state_with_mcp_tool_calls`], so the owner
 /// classifies it as a dispatchable server-owned call and signals `loop`.
+///
+/// Tests that drive the loop through this call are gated on
+/// `openai-mcp-tools`, the feature that gives the owner an MCP dispatcher;
+/// without it the same call resolves to no dispatcher and the owner
+/// correctly signals `done` (the FIPS build ships that way).
+#[cfg(feature = "openai-mcp-tools")]
 fn mcp_tool_call(call_id: &str) -> Value {
     json!({
         "type": "function_call",

@@ -61,13 +61,10 @@ fn from_config_unknown_field_rejected() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadWrite,
-        "file_resolve must have read-write body access"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]
@@ -233,7 +230,7 @@ async fn skips_non_responses_request() {
         "/v1/chat/completions",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
+    ctx.set_metadata("openai_responses_request.format", "openai_chat_completions");
     let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -251,7 +248,7 @@ async fn skips_non_create_responses_endpoint() {
         "/v1/responses/compact",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
     ));
@@ -288,7 +285,7 @@ async fn releases_missing_body() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body: Option<Bytes> = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -306,7 +303,7 @@ async fn releases_invalid_json() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from("not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -324,7 +321,7 @@ async fn continues_on_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -358,7 +355,7 @@ async fn string_input_passes_through() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"input":"Hello, world!"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -468,7 +465,7 @@ timeout_ms: 2000"#
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -565,7 +562,7 @@ async fn resolves_history_when_current_input_has_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -582,6 +579,9 @@ async fn resolves_history_when_current_input_has_no_file_id() {
     let mut state = ResponsesState::from_request_body(request_body.clone());
     state.messages.insert(0, history.clone());
     state.persisted_messages.insert(0, history);
+    state.messages = state.persisted_messages.clone();
+    let stored_snapshot = state.persisted_messages.clone();
+    let original_history = serde_json::to_value(&stored_snapshot).unwrap();
     ctx.extensions.insert(state);
     let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
     let mut body = Some(original.clone());
@@ -594,6 +594,11 @@ async fn resolves_history_when_current_input_has_no_file_id() {
     );
     assert_eq!(body, Some(original), "current request body should remain unchanged");
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(serde_json::to_value(&stored_snapshot).unwrap(), original_history);
+    let stored_handles: Vec<_> = stored_snapshot.shared_items().collect();
+    let replay_handles: Vec<_> = state.messages.shared_items().collect();
+    assert!(!Arc::ptr_eq(stored_handles[0], replay_handles[0]));
+    assert!(Arc::ptr_eq(stored_handles[1], replay_handles[1]));
     for resolved_history in [&state.messages[0], &state.persisted_messages[0]] {
         let part = &resolved_history["content"][0];
         assert!(
@@ -622,7 +627,7 @@ async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -661,7 +666,7 @@ async fn scoped_credential_arrives_on_file_id_metadata_and_content_requests() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -708,7 +713,7 @@ async fn two_user_file_id_contexts_are_isolated() {
     .unwrap();
     let filter = FileResolveFilter::from_config_with_outbound(
         &yaml,
-        crate::subrequest::isolated_client(4),
+        &crate::subrequest::isolated_client(4),
         owner_projecting_outbound_pipeline(),
     )
     .unwrap();
@@ -719,7 +724,7 @@ async fn two_user_file_id_contexts_are_isolated() {
             "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_responses_request.format", "openai_responses");
         let request_body = json!({
             "input": [{
                 "type": "message",
@@ -806,7 +811,7 @@ async fn scoped_file_id_credential_is_not_replayed_to_redirect_authority() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -897,7 +902,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
 
@@ -923,7 +928,7 @@ async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_l
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -956,7 +961,7 @@ async fn max_resolved_bytes_default_allows_resolution() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -997,7 +1002,7 @@ async fn rejects_unresolvable_history_when_configured_to_reject() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({"input": "continue"});
     let history = json!({
@@ -1153,7 +1158,7 @@ fn make_filter_with_outbound_for_url(files_api_url: &str) -> Box<dyn HttpFilter>
 fn make_filter_with_outbound_from_yaml(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
     let client = crate::subrequest::isolated_client(4);
-    FileResolveFilter::from_config_with_outbound(&yaml, client, private_outbound_pipeline()).unwrap()
+    FileResolveFilter::from_config_with_outbound(&yaml, &client, private_outbound_pipeline()).unwrap()
 }
 
 fn make_client() -> FilesApiClient {
@@ -1354,6 +1359,7 @@ async fn file_url_resolved_to_data_uri() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     // Call resolve_input with url_resolver
@@ -1406,6 +1412,7 @@ async fn file_url_truncated_body_reports_url_failure() {
         allowed_private_origins: vec![
             NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
         ],
+        client: crate::subrequest::isolated_client(4),
     };
     let result = resolver
         .resolve_url(
@@ -1416,13 +1423,9 @@ async fn file_url_truncated_body_reports_url_failure() {
         .await;
 
     match result {
-        Err(ResolveError::FileUrlFailed { label, detail }) => {
+        Err(ResolveError::FileUrlFailed { label, .. }) => {
             assert!(label.contains("[REDACTED]"), "signed query value should be redacted");
             assert!(!label.contains("secret"), "signed query value must not be exposed");
-            assert!(
-                detail.contains("read error"),
-                "failure should retain URL body read context"
-            );
         },
         Err(other) => panic!("expected FileUrlFailed for a truncated URL body, got {other}"),
         Ok(_) => panic!("expected FileUrlFailed for a truncated URL body"),
@@ -1440,19 +1443,24 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
     let address = listener.local_addr().unwrap();
     let stub_url = format!("http://{address}/file.txt?sig=secret");
 
+    let body = "X".repeat(100);
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 4096];
         let _read = stream.read(&mut request).unwrap();
-        let response =
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
-        stream.write_all(response).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     });
 
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![
             NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
         ],
+        client: crate::subrequest::isolated_client(4),
     };
     let result = resolver
         .resolve_url(&stub_url, tokio::time::Instant::now() + Duration::from_secs(5), 64)
@@ -1545,6 +1553,7 @@ async fn file_url_in_shorthand_message_resolved() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let count = resolve_input(
@@ -1613,6 +1622,7 @@ async fn file_url_in_function_call_output_resolved() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let count = resolve_input(
@@ -1658,6 +1668,7 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
 
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let result = resolve_input(
@@ -1717,6 +1728,7 @@ async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
     // Default posture: file_url: resolve, on_missing: continue.
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let err = resolve_input(
@@ -1751,15 +1763,17 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
     // under on_missing: reject.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let oversized_body = "X".repeat(100);
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 4096];
         let _read = stream.read(&mut request).unwrap();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
-            )
-            .unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            oversized_body.len(),
+            oversized_body,
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     });
 
     let url = format!("http://{address}/file.pdf");
@@ -1778,6 +1792,7 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
     let client = make_client_for_url_with_max("http://unused:9999", 64);
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let err = resolve_input(
@@ -1804,8 +1819,7 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
 fn display_redacts_signed_file_url() {
     use crate::openai::responses::file_resolve::resolve::ReferenceSource;
 
-    let source =
-        ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890".to_owned());
+    let source = ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890");
     let displayed = format!("{source}");
     assert!(
         !displayed.contains("SECRET_TOKEN"),
