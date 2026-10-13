@@ -35,6 +35,7 @@
 use std::sync::Once;
 
 use metrics::{Unit, counter, describe_histogram, histogram};
+use praxis_ai_apis::promotion::is_promotable_value;
 use praxis_filter::HttpFilterContext;
 
 /// Prompt tokens (backend-reported) per request, cumulative.
@@ -100,7 +101,7 @@ pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
         // model as an `X-Model` request header before token_count runs; fall back
         // to it so the label is populated even when no format filter ran.
         .or_else(|| ctx.request.headers.get("x-model").and_then(|v| v.to_str().ok()))
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty() && is_promotable_value(v))
         .unwrap_or("unknown")
         .to_owned()
 }
