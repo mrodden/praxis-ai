@@ -31,18 +31,24 @@ use std::{
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, MODEL_PROVIDER_HEADER, json_body::replace_json_body};
+use praxis_filter::{
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    body::DEFAULT_JSON_BODY_MAX_BYTES, parse_filter_config,
+};
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
         ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
-        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
-        set_credential_metadata,
+        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, ROUTE_TARGET_MODEL,
+        ROUTE_TARGET_PATHS, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
     picker,
@@ -60,6 +66,9 @@ const MAX_BINDINGS: usize = 10_000;
 
 /// Maximum session affinity TTL in seconds (24 hours).
 const MAX_TTL_SECS: u64 = 86_400;
+
+/// Internal provider marker retained for provider-specific path rewrites.
+const PROVIDER_HEADER: HeaderName = HeaderName::from_static(MODEL_PROVIDER_HEADER);
 
 /// Maximum number of configured management-path skip prefixes.
 const MAX_SKIP_PATHS: usize = 64;
@@ -113,6 +122,12 @@ struct IntelligentRouteConfig {
     /// Header name that carries the model name (default: `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
+
+    /// Resolve inference model routing from the request body during the body
+    /// phase. This prevents a client-supplied model header from selecting a
+    /// backend before `model_to_header` has inspected the body.
+    #[serde(default)]
+    body_authoritative: bool,
 
     /// Request-path prefixes that bypass model resolution entirely.
     ///
@@ -458,6 +473,8 @@ pub struct IntelligentRouteFilter {
     provider_hop_clusters: BTreeSet<String>,
     /// Header that carries the model name.
     model_header: HeaderName,
+    /// Resolve inference routes from the buffered body instead of a client header.
+    body_authoritative: bool,
     /// Management/discovery path prefixes that bypass model resolution.
     skip_paths: Vec<Arc<str>>,
     /// Cluster that serves skipped management paths (None = leave untouched).
@@ -499,6 +516,7 @@ impl IntelligentRouteFilter {
 
         Ok(Box::new(Self {
             model_header,
+            body_authoritative: cfg.body_authoritative,
             skip_paths,
             management_cluster,
             _reload_handle: reload_handle,
@@ -524,6 +542,7 @@ impl IntelligentRouteFilter {
             tracing::debug!(path = %path, "intelligent_route: management path but cluster already set; preserving");
             return Some(FilterAction::Continue);
         }
+
         if let Some(cluster) = &self.management_cluster {
             ctx.cluster = Some(Arc::clone(cluster));
             tracing::debug!(
@@ -533,8 +552,49 @@ impl IntelligentRouteFilter {
             );
         } else {
             tracing::debug!(path = %path, "intelligent_route: management path; skipping model resolution");
+            ctx.set_metadata("intelligent_route.management_skip", "true");
         }
         Some(FilterAction::Continue)
+    }
+
+    /// Rewrite the client-facing model to the provider-specific target after
+    /// routing has selected a candidate. The model header is promoted by the
+    /// preceding `model_to_header` filter during the same body pass, which
+    /// keeps client-supplied routing headers out of the trust boundary.
+    fn rewrite_selected_model(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<(), FilterError> {
+        let Some(raw) = body.as_ref() else {
+            return Ok(());
+        };
+        let Some(target_model) = ctx.get_metadata(ROUTE_TARGET_MODEL).map(str::to_owned) else {
+            return Ok(());
+        };
+        let path = ctx.request.uri.path();
+        if let Some(paths) = ctx.get_metadata(ROUTE_TARGET_PATHS)
+            && !paths.split(',').any(|configured| configured == path)
+        {
+            return Ok(());
+        }
+        let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
+            return Ok(());
+        };
+        let Some(object) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(client_model) = object.get("model").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
+        if object.get("model").and_then(Value::as_str) != Some(target_model.as_str()) {
+            object.insert("model".to_owned(), Value::String(target_model));
+            replace_json_body(body, &value, self.name(), "model").map_err(|error| {
+                FilterError::from(format!("intelligent_route: request serialization failed: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     /// Core routing path: session affinity lookup, admission filtering,
@@ -790,6 +850,7 @@ fn validate_session_affinity_config(cfg: &SessionAffinityConfig) -> Result<(), F
     Ok(())
 }
 
+#[expect(clippy::too_many_lines, reason = "ordered request-phase routing guards")]
 #[async_trait]
 impl HttpFilter for IntelligentRouteFilter {
     fn name(&self) -> &'static str {
@@ -806,6 +867,20 @@ impl HttpFilter for IntelligentRouteFilter {
         true
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(DEFAULT_JSON_BODY_MAX_BYTES),
+        }
+    }
+
+    fn needs_request_context(&self) -> bool {
+        true
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // Client-supplied routing protocol context is never allowed to survive an
         // edge routing decision.
@@ -815,6 +890,7 @@ impl HttpFilter for IntelligentRouteFilter {
             .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+        ctx.request_headers_to_remove.push(PROVIDER_HEADER.clone());
 
         // Management and discovery endpoints bypass model resolution entirely.
         if let Some(action) = self.try_management_skip(ctx) {
@@ -823,6 +899,10 @@ impl HttpFilter for IntelligentRouteFilter {
 
         if ctx.cluster.is_some() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
+            return Ok(FilterAction::Continue);
+        }
+
+        if self.body_authoritative && ctx.get_metadata("mcp.method").is_none() {
             return Ok(FilterAction::Continue);
         }
 
@@ -836,6 +916,72 @@ impl HttpFilter for IntelligentRouteFilter {
         };
 
         self.select_and_route(ctx, &snap, kind, &name)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+        if let Some(action) = self.try_management_skip(ctx) {
+            return Ok(action);
+        }
+        if ctx.get_metadata("intelligent_route.management_skip") == Some("true") {
+            return Ok(FilterAction::Continue);
+        }
+        let snap = self.snapshot.load();
+        let (action, kind) = if ctx.cluster.is_some() {
+            (FilterAction::Continue, None)
+        } else {
+            let lookup = if self.body_authoritative && ctx.get_metadata("mcp.method").is_none() {
+                extract_body_model_lookup(body)
+            } else {
+                match extract_lookup(ctx, &self.model_header) {
+                    Lookup::Skip => extract_body_model_lookup(body),
+                    other => other,
+                }
+            };
+            let Lookup::Route { kind, name } = lookup else {
+                return Ok(FilterAction::Continue);
+            };
+            let action = self.select_and_route(ctx, &snap, kind, &name)?;
+            (action, Some(kind))
+        };
+        let inference_route = kind == Some(CapabilityKind::InferenceModel)
+            || ctx.get_metadata(ROUTE_KIND) == Some(CapabilityKind::InferenceModel.as_str());
+        if matches!(action, FilterAction::Continue) && inference_route {
+            self.rewrite_selected_model(ctx, body)?;
+        }
+        Ok(action)
+    }
+}
+
+/// Extract the public model directly from the buffered request body.
+///
+/// `model_to_header` promotes the value by queuing an outbound header update;
+/// that update is intentionally not visible in `ctx.request.headers` during
+/// the same body pass. Reading the body here lets `intelligent_route` select the
+/// candidate before forwarding without trusting a client-supplied header.
+fn extract_body_model_lookup(body: &Option<Bytes>) -> Lookup {
+    let Some(raw) = body.as_ref() else {
+        return Lookup::Skip;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+        return Lookup::Skip;
+    };
+    let Some(model) = value.get("model").and_then(Value::as_str) else {
+        return Lookup::Skip;
+    };
+    if model.trim().is_empty() || model.len() > MAX_HEADER_VALUE_LEN {
+        return Lookup::Invalid;
+    }
+    Lookup::Route {
+        kind: CapabilityKind::InferenceModel,
+        name: model.to_owned(),
     }
 }
 
@@ -1128,6 +1274,21 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     ctx.set_metadata(ROUTE_NAME, &*candidate.name);
     ctx.set_metadata(ROUTE_SITE, &*candidate.site);
     ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
+    if let Some(target_model) = &candidate.target_model {
+        ctx.set_metadata(ROUTE_TARGET_MODEL, target_model.as_ref());
+        if let Some(paths) = &candidate.paths {
+            ctx.set_metadata(
+                ROUTE_TARGET_PATHS,
+                paths.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(","),
+            );
+        }
+    }
+    if candidate.kind == CapabilityKind::InferenceModel
+        && let Some(provider) = &candidate.provider
+        && let Ok(provider) = HeaderValue::from_str(provider.as_ref())
+    {
+        ctx.request_headers_to_set.push((PROVIDER_HEADER.clone(), provider));
+    }
     if let Some(rank) = candidate.rank {
         ctx.set_metadata(ROUTE_RANK, rank.to_string());
     }
@@ -1211,7 +1372,7 @@ mod tests {
 
     use super::*;
 
-    fn versioned_envelope(candidates: &serde_json::Value) -> String {
+    fn versioned_envelope(candidates: &Value) -> String {
         let overlay = serde_json::json!({
             "network": "test-net",
             "local_site": "site-a",
@@ -2102,6 +2263,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_candidate_rewrites_target_model() {
+        let filter = parse(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: public-model\n    site: site-a\n    cluster: vertex\n    target_model: vertex/internal-model\n    paths: [/v1/messages]\n",
+        )
+        .unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/v1/messages");
+        req.headers.insert("X-Model", HeaderValue::from_static("public-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        let mut body = Some(Bytes::from(r#"{"model":"public-model","messages":[]}"#));
+
+        let _unused = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let rewritten: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        assert_eq!(rewritten["model"], "vertex/internal-model");
+        assert_eq!(
+            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
+            Some("public-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn body_model_routes_when_promotion_header_is_not_yet_visible() {
+        let filter = parse(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: public-model\n    site: site-a\n    cluster: vertex\n    target_model: vertex/internal-model\n    paths: [/v1/messages]\n",
+        )
+        .unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from(r#"{"model":"public-model","messages":[]}"#));
+
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        let _unused = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert_eq!(ctx.cluster.as_deref(), Some("vertex"));
+        let rewritten: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        assert_eq!(rewritten["model"], "vertex/internal-model");
+    }
+
+    #[tokio::test]
+    async fn selected_candidate_does_not_rewrite_outside_target_paths() {
+        let filter = parse(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: public-model\n    site: site-a\n    cluster: vertex\n    target_model: vertex/internal-model\n    paths: [/v1/messages]\n",
+        )
+        .unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
+        req.headers.insert("X-Model", HeaderValue::from_static("public-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        let original = Bytes::from(r#"{"model":"public-model","messages":[]}"#);
+        let mut body = Some(original.clone());
+
+        let _unused = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert_eq!(body, Some(original));
+        assert!(ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none());
+    }
+
+    #[tokio::test]
     async fn remote_route_writes_metadata() {
         let f = make_filter(&[("inference_model", "llama", "site-b", "remote-gw")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
@@ -2226,6 +2446,7 @@ mod tests {
         let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            body_authoritative: false,
             _reload_handle: None,
             skip_paths: Vec::new(),
             management_cluster: None,
@@ -2380,6 +2601,7 @@ mod tests {
         )));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            body_authoritative: false,
             _reload_handle: None,
             skip_paths: Vec::new(),
             management_cluster: None,
@@ -3086,6 +3308,7 @@ mod tests {
         )])));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            body_authoritative: false,
             _reload_handle: None,
             skip_paths: Vec::new(),
             management_cluster: None,
@@ -3278,6 +3501,7 @@ mod tests {
         let shared = Arc::new(ArcSwap::from_pointee(snap));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            body_authoritative: false,
             _reload_handle: None,
             skip_paths: Vec::new(),
             management_cluster: None,
@@ -3473,6 +3697,13 @@ mod tests {
             descriptor::validate_candidates(vec![
                 CandidateConfig {
                     cluster: cluster1.to_owned(),
+                    provider: None,
+                    target_model: None,
+                    paths: None,
+                    catalog: None,
+                    display_name: None,
+                    owned_by: None,
+                    created: None,
                     credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
@@ -3482,6 +3713,13 @@ mod tests {
                 },
                 CandidateConfig {
                     cluster: cluster2.to_owned(),
+                    provider: None,
+                    target_model: None,
+                    paths: None,
+                    catalog: None,
+                    display_name: None,
+                    owned_by: None,
+                    created: None,
                     credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
@@ -3499,6 +3737,13 @@ mod tests {
         RouteSnapshot::from_static(
             descriptor::validate_candidates(vec![CandidateConfig {
                 cluster: cluster.to_owned(),
+                provider: None,
+                target_model: None,
+                paths: None,
+                catalog: None,
+                display_name: None,
+                owned_by: None,
+                created: None,
                 credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
@@ -3534,6 +3779,7 @@ mod tests {
     ) -> IntelligentRouteFilter {
         IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            body_authoritative: false,
             _reload_handle: None,
             skip_paths: Vec::new(),
             management_cluster: None,
@@ -3549,6 +3795,13 @@ mod tests {
             route_candidates.push(RouteCandidate {
                 admission_state: AdmissionState::from_overlay_str(admission_str).unwrap(),
                 cluster: Arc::from(*cluster),
+                provider: None,
+                target_model: None,
+                paths: None,
+                catalog: None,
+                display_name: None,
+                owned_by: None,
+                created: None,
                 credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
