@@ -373,6 +373,10 @@ impl HttpFilter for TokenCountFilter {
     /// other providers, detects the content-type to select the body
     /// extraction strategy used by `on_response_body`.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // A retry can reuse the request context after an aborted response; clear
+        // all token_count working state, including the SSE scanner buffers.
+        clear_all_metadata(ctx);
+
         let is_success = ctx.response_header.as_ref().is_some_and(|r| r.status.is_success());
 
         if !is_success {
